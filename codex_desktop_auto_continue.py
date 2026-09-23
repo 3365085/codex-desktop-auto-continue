@@ -4,21 +4,27 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
 import json
 import os
 import re
 import select
+import signal
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Sequence, TextIO
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 TRANSIENT_CODES = frozenset(
     {
@@ -67,6 +73,108 @@ class PendingContinuation:
     next_attempt_at: float = 0.0
 
 
+class WebSocketError(RuntimeError):
+    """The local Node inspector could not be used."""
+
+
+class InspectorWebSocket:
+    """Small dependency-free WebSocket client for the local Node inspector."""
+
+    def __init__(self, url: str, timeout: float) -> None:
+        match = re.match(r"^ws://([^/:]+):(\d+)(/.*)$", url)
+        if not match:
+            raise WebSocketError(f"unsupported inspector URL: {url}")
+        self.host = match.group(1)
+        self.port = int(match.group(2))
+        self.path = match.group(3)
+        self.timeout = timeout
+        self.sock = socket.create_connection((self.host, self.port), timeout=timeout)
+        self.sock.settimeout(timeout)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            f"GET {self.path} HTTP/1.1\r\n"
+            f"Host: {self.host}:{self.port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode("ascii")
+        self.sock.sendall(request)
+        header = self._read_until(b"\r\n\r\n")
+        if not header.startswith(b"HTTP/1.1 101"):
+            self.close()
+            raise WebSocketError("Node inspector WebSocket handshake failed")
+
+    def _read_until(self, marker: bytes) -> bytes:
+        data = bytearray()
+        while marker not in data:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise WebSocketError("inspector closed during handshake")
+            data.extend(chunk)
+        return bytes(data)
+
+    def send_json(self, payload: dict[str, object]) -> None:
+        data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        mask = os.urandom(4)
+        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(data))
+        length = len(data)
+        if length < 126:
+            header = bytes((0x81, 0x80 | length))
+        elif length < 65536:
+            header = bytes((0x81, 0x80 | 126)) + struct.pack("!H", length)
+        else:
+            header = bytes((0x81, 0x80 | 127)) + struct.pack("!Q", length)
+        self.sock.sendall(header + mask + masked)
+
+    def recv_json(self) -> dict[str, object]:
+        first = self._recv_exact(2)
+        opcode = first[0] & 0x0F
+        length = first[1] & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self._recv_exact(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._recv_exact(8))[0]
+        mask = self._recv_exact(4) if first[1] & 0x80 else b""
+        data = self._recv_exact(length)
+        if mask:
+            data = bytes(value ^ mask[index % 4] for index, value in enumerate(data))
+        if opcode == 0x9:  # ping
+            self._send_control(0xA, data)
+            return self.recv_json()
+        if opcode == 0x8:
+            raise WebSocketError("inspector WebSocket closed")
+        if opcode != 0x1:
+            return self.recv_json()
+        try:
+            value = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise WebSocketError("invalid inspector response") from exc
+        if not isinstance(value, dict):
+            raise WebSocketError("invalid inspector response object")
+        return value
+
+    def _recv_exact(self, size: int) -> bytes:
+        data = bytearray()
+        while len(data) < size:
+            chunk = self.sock.recv(size - len(data))
+            if not chunk:
+                raise WebSocketError("inspector WebSocket closed")
+            data.extend(chunk)
+        return bytes(data)
+
+    def _send_control(self, opcode: int, data: bytes) -> None:
+        mask = os.urandom(4)
+        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(data))
+        self.sock.sendall(bytes((0x80 | opcode, 0x80 | len(data))) + mask + masked)
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
 def default_codex_home() -> Path:
     configured = os.environ.get("CODEX_HOME")
     return Path(configured).expanduser() if configured else Path.home() / ".codex"
@@ -76,6 +184,68 @@ def default_lock_file() -> Path:
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
     base = Path(runtime_dir) if runtime_dir else Path("/tmp") / f"codex-auto-continue-{os.getuid()}"
     return base / "watcher.lock"
+
+
+def inspector_target(port: int, timeout_ms: int) -> str | None:
+    """Return the Node inspector WebSocket URL, if the local port is open."""
+
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/json/list", timeout=timeout_ms / 1000.0
+        ) as response:
+            targets = json.load(response)
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        return None
+    if not isinstance(targets, list):
+        return None
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        url = target.get("webSocketDebuggerUrl")
+        if isinstance(url, str) and url.startswith("ws://"):
+            return url
+    return None
+
+
+def chatgpt_main_pid() -> int | None:
+    """Find the Electron main process without matching renderer children."""
+
+    for entry in Path("/proc").glob("[0-9]*"):
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        args = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+        if args and Path(args[0]).name == "ChatGPT" and not any(
+            arg.startswith("--type=") for arg in args[1:]
+        ):
+            try:
+                return int(entry.name)
+            except ValueError:
+                continue
+    return None
+
+
+def ensure_node_inspector(port: int, timeout_ms: int) -> tuple[str | None, bool, str]:
+    """Open the loopback-only Electron inspector on demand when needed."""
+
+    existing = inspector_target(port, timeout_ms)
+    if existing:
+        return existing, False, ""
+    pid = chatgpt_main_pid()
+    if pid is None:
+        return None, False, "Codex Desktop main process was not found"
+    try:
+        os.kill(pid, signal.SIGUSR1)
+    except OSError as exc:
+        return None, False, f"could not enable Desktop inspector: {exc}"
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        target = inspector_target(port, min(timeout_ms, 250))
+        if target:
+            return target, True, ""
+        time.sleep(0.05)
+    return None, True, f"Desktop inspector did not open on 127.0.0.1:{port}"
 
 
 def clean_text(value: object) -> str:
@@ -183,6 +353,186 @@ def queue_continue(codex_bin: str, thread_id: str, message: str) -> tuple[bool, 
 
     detail = (completed.stdout + completed.stderr).strip()
     return completed.returncode == 0, detail
+
+
+def thread_name(codex_bin: str, thread_id: str, timeout_ms: int) -> tuple[bool, str, str]:
+    """Read the Desktop display name without creating a turn."""
+
+    command = [codex_bin, "app-server", "--listen", "stdio://"]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+    except OSError as exc:
+        return False, "", str(exc)
+
+    assert process.stdin is not None
+    assert process.stdout is not None
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    try:
+        initialize = {
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "codex-desktop-auto-continue",
+                    "title": "Codex Desktop Auto Continue",
+                    "version": VERSION,
+                },
+                "capabilities": {"experimentalApi": True},
+            },
+        }
+        if not _write_json_rpc(process.stdin, initialize):
+            return False, "", "could not write initialize request"
+        ok, _, detail = _read_json_rpc_response(process.stdout, 1, deadline)
+        if not ok:
+            return False, "", detail
+        if not _write_json_rpc(process.stdin, {"method": "initialized", "params": {}}):
+            return False, "", "could not write initialized notification"
+        if not _write_json_rpc(
+            process.stdin,
+            {
+                "id": 2,
+                "method": "thread/read",
+                "params": {"threadId": thread_id, "includeTurns": False},
+            },
+        ):
+            return False, "", "could not write thread/read request"
+        ok, result, detail = _read_json_rpc_response(process.stdout, 2, deadline)
+        if not ok:
+            return False, "", detail
+        thread = result.get("thread") if isinstance(result, dict) else None
+        name = thread.get("name") if isinstance(thread, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            return False, "", "thread/read returned no Desktop thread name"
+        return True, name, ""
+    finally:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+        try:
+            process.terminate()
+            process.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+            process.wait()
+
+
+def _desktop_renderer_script(thread_title: str, prefer_goal: bool, wait_ms: int) -> str:
+    title_literal = json.dumps(thread_title, ensure_ascii=False)
+    goal_literal = "true" if prefer_goal else "false"
+    return f"""
+(async () => {{
+  const title = {title_literal};
+  const preferGoal = {goal_literal};
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const visible = (element) => !!element && !!element.offsetParent;
+  const aria = (value) => [...document.querySelectorAll('[aria-label]')]
+    .find((element) => visible(element) && element.getAttribute('aria-label') === value);
+  const thread = aria(title);
+  if (thread) {{
+    thread.click();
+    await wait({wait_ms});
+  }} else if (!document.body.innerText.includes(title)) {{
+    return {{ok: false, detail: 'Desktop thread is not visible in the sidebar: ' + title}};
+  }}
+
+  const restore = aria('恢复目标');
+  if (restore) {{
+    restore.click();
+    return {{ok: true, action: 'resume-goal'}};
+  }}
+  const pause = aria('暂停目标');
+  if (pause) {{
+    return {{ok: true, action: 'goal-already-active'}};
+  }}
+  if (preferGoal) {{
+    return {{ok: false, detail: 'Goal resume button is not visible'}};
+  }}
+
+  const retry = [...document.querySelectorAll('button')]
+    .find((element) => visible(element) && ['重试', 'Retry', 'retry'].includes(element.innerText.trim()));
+  if (retry) {{
+    retry.click();
+    return {{ok: true, action: 'retry-failed-turn'}};
+  }}
+  return {{ok: false, detail: 'Desktop retry button is not visible'}};
+}})()
+"""
+
+
+def desktop_resume(
+    codex_bin: str,
+    thread_id: str,
+    *,
+    prefer_goal: bool,
+    inspector_port: int,
+    timeout_ms: int,
+) -> tuple[bool, str]:
+    """Use the same Desktop button the user would click, in the live UI."""
+
+    ok, title, detail = thread_name(codex_bin, thread_id, timeout_ms)
+    if not ok:
+        return False, detail
+    target, _, detail = ensure_node_inspector(inspector_port, timeout_ms)
+    if not target:
+        return False, detail
+    try:
+        websocket = InspectorWebSocket(target, timeout_ms / 1000.0)
+        try:
+            expression = (
+                "(async()=>{"
+                "const e=process.getBuiltinModule('module').createRequire(process.execPath)('electron');"
+                "const windows=e.BrowserWindow.getAllWindows();"
+                "const w=windows.find((candidate)=>candidate.isFocused())||windows[0];"
+                "if(!w)return {ok:false,detail:'no Desktop BrowserWindow'};"
+                "try{return await w.webContents.executeJavaScript("
+                + json.dumps(_desktop_renderer_script(title, prefer_goal, 700), ensure_ascii=False)
+                + ",true)}catch(error){return {ok:false,detail:String(error)}}"
+                "})()"
+            )
+            websocket.send_json(
+                {
+                    "id": 1,
+                    "method": "Runtime.evaluate",
+                    "params": {
+                        "expression": expression,
+                        "awaitPromise": True,
+                        "returnByValue": True,
+                    },
+                }
+            )
+            deadline = time.monotonic() + timeout_ms / 1000.0
+            while time.monotonic() < deadline:
+                response = websocket.recv_json()
+                if response.get("id") != 1:
+                    continue
+                result = response.get("result")
+                if not isinstance(result, dict):
+                    return False, "invalid Desktop inspector response"
+                exception = result.get("exceptionDetails")
+                if exception:
+                    return False, str(exception.get("text") or "Desktop script failed")
+                value = result.get("result")
+                value = value.get("value") if isinstance(value, dict) else None
+                if not isinstance(value, dict):
+                    return False, "Desktop inspector returned no action result"
+                if value.get("ok") is True:
+                    return True, str(value.get("action") or "Desktop action completed")
+                return False, str(value.get("detail") or "Desktop action was not completed")
+            return False, "timed out waiting for Desktop inspector"
+        finally:
+            websocket.close()
+    except (OSError, WebSocketError, ValueError) as exc:
+        return False, str(exc)
 
 
 def _write_json_rpc(stream: TextIO, message: dict[str, object]) -> bool:
@@ -402,7 +752,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Continue the same Codex Desktop thread after transient overload or "
-            "response-stream failures. Active Goals use app-server continuation."
+            "response-stream failures by clicking the live Desktop retry/Goal button."
         )
     )
     parser.add_argument(
@@ -442,7 +792,18 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--app-server-timeout-ms",
         type=int,
         default=15_000,
-        help="Timeout for an app-server Goal continuation (default: 15000 ms).",
+        help="Timeout for Desktop metadata and inspector calls (default: 15000 ms).",
+    )
+    parser.add_argument(
+        "--inspector-port",
+        type=int,
+        default=9229,
+        help="Loopback Node inspector port used for live Desktop buttons (default: 9229).",
+    )
+    parser.add_argument(
+        "--no-desktop-ui",
+        action="store_true",
+        help="Disable live Desktop button control and use the legacy queue fallback.",
     )
     parser.add_argument(
         "--scan-existing",
@@ -465,6 +826,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     for name in ("poll_ms", "queue_retry_ms", "app_server_timeout_ms"):
         if getattr(args, name) < 10:
             parser.error(f"--{name.replace('_', '-')} must be at least 10")
+    if args.inspector_port < 1 or args.inspector_port > 65535:
+        parser.error("--inspector-port must be between 1 and 65535")
     return args
 
 
@@ -483,7 +846,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(
         f"[codex-auto-continue] watching {root}; max_attempts={args.max_attempts}; "
-        f"message={args.message!r}; goal_mode=app-server; dry_run={args.dry_run}",
+        f"message={args.message!r}; desktop_ui={not args.no_desktop_ui}; "
+        f"dry_run={args.dry_run}",
         file=sys.stderr,
         flush=True,
     )
@@ -550,23 +914,81 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.dry_run:
                     if action.goal_active is True:
                         print(
-                            f"[codex-auto-continue] dry-run: would request Goal continuation "
-                            f"on {action.thread_id} after {action.reason}",
+                            f"[codex-auto-continue] dry-run: would click the Desktop Goal "
+                            f"continuation button on {action.thread_id} after {action.reason}",
                             file=sys.stderr,
                             flush=True,
                         )
                     elif action.goal_active is None:
                         print(
                             f"[codex-auto-continue] dry-run: would inspect Goal status for "
-                            f"{action.thread_id}; active => Goal continuation, absent => "
-                            f"queue {args.message!r}",
+                            f"{action.thread_id}; active => Goal continuation (click 恢复目标), "
+                            f"no Goal => click 重试 (fallback: queue {args.message!r})",
                             file=sys.stderr,
                             flush=True,
                         )
                     del pending[event_key]
                     continue
 
-                if action.goal_active is not False:
+                if not args.no_desktop_ui and action.goal_active is not False:
+                    ok, detail = desktop_resume(
+                        args.codex_bin,
+                        action.thread_id,
+                        prefer_goal=action.goal_active is True,
+                        inspector_port=args.inspector_port,
+                        timeout_ms=args.app_server_timeout_ms,
+                    )
+                    if ok:
+                        continuation_counts[action.thread_id] = count + 1
+                        print(
+                            f"[codex-auto-continue] clicked Desktop {detail} on "
+                            f"{action.thread_id} after {action.reason} "
+                            f"({count + 1}/{args.max_attempts})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        del pending[event_key]
+                        continue
+
+                    if action.goal_active is True:
+                        print(
+                            f"[codex-auto-continue] Desktop Goal button was not usable for "
+                            f"{action.thread_id}; will retry without sending a new message: {detail}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        action.next_attempt_at = now + args.queue_retry_ms / 1000.0
+                        if action.attempts == 1 or action.attempts % 100 == 0:
+                            print(
+                                f"[codex-auto-continue] Desktop Goal retry attempt "
+                                f"{action.attempts} for {action.thread_id}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        continue
+
+                    print(
+                        f"[codex-auto-continue] Desktop retry button failed for "
+                        f"{action.thread_id}; falling back to {args.message!r}: {detail}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+                elif action.goal_active is True and not args.no_desktop_ui:
+                    action.next_attempt_at = now + args.queue_retry_ms / 1000.0
+                    continue
+
+                if action.goal_active is True and not args.no_desktop_ui:
+                    # The live Goal control is the only safe way to resume a Goal.  A
+                    # queue message would be a new user turn and could lose the Goal's
+                    # stateful continuation context, so keep the event pending.
+                    continue
+
+                if action.goal_active is False:
+                    del pending[event_key]
+                    continue
+
+                if action.goal_active is not False and args.no_desktop_ui:
                     operation = "Goal continuation"
                     ok, detail = goal_continue(
                         args.codex_bin,
@@ -577,27 +999,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if ok:
                         continuation_counts[action.thread_id] = count + 1
                         print(
-                            f"[codex-auto-continue] {('dry-run: would request ' if args.dry_run else 'requested ')}"
-                            f"Goal continuation on {action.thread_id} after {action.reason} "
+                            f"[codex-auto-continue] requested legacy {operation} on "
+                            f"{action.thread_id} after {action.reason} "
                             f"({count + 1}/{args.max_attempts})",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        del pending[event_key]
-                        continue
-
-                    if action.goal_active is True:
-                        print(
-                            f"[codex-auto-continue] {operation} failed for {action.thread_id}; "
-                            f"falling back to {args.message!r}: {detail}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-
-                    elif detail.startswith("Goal status is ") and not detail.endswith("none"):
-                        print(
-                            f"[codex-auto-continue] {detail} for {action.thread_id}; "
-                            "leaving the Goal unchanged",
                             file=sys.stderr,
                             flush=True,
                         )

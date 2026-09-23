@@ -1,5 +1,5 @@
 [Unit]
-Description=Continue transiently failed Codex Desktop turns and active Goals
+Description=Click Codex Desktop retry and Goal-resume buttons after transient failures
 After=graphical-session.target
 
 [Service]

@@ -311,6 +311,18 @@ class SessionTests(unittest.TestCase):
         self.assertIn('"method": "thread/goal/set"', process.stdin.getvalue())
         self.assertNotIn('"method": "thread/goal/get"', process.stdin.getvalue())
 
+    def test_desktop_renderer_targets_official_buttons(self):
+        script = MODULE._desktop_renderer_script("A thread", True, 700)
+        self.assertIn("恢复目标", script)
+        self.assertIn("暂停目标", script)
+        self.assertIn("重试", script)
+        self.assertIn("A thread", script)
+
+    def test_desktop_options_default_to_live_ui(self):
+        args = MODULE.parse_args([])
+        self.assertFalse(args.no_desktop_ui)
+        self.assertEqual(args.inspector_port, 9229)
+
 
 if __name__ == "__main__":
     unittest.main()
