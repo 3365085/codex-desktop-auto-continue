@@ -30,7 +30,9 @@ sed \
   "$project_dir/systemd/codex-desktop-auto-continue.service.in" > "$unit_path"
 
 systemctl --user daemon-reload
-systemctl --user enable --now codex-desktop-auto-continue.service
+systemctl --user enable codex-desktop-auto-continue.service
+# Restart on upgrades so an already-running watcher loads the copied code.
+systemctl --user restart codex-desktop-auto-continue.service
 
 echo "Installed and started codex-desktop-auto-continue.service"
 echo "Status: systemctl --user status codex-desktop-auto-continue.service --no-pager"
