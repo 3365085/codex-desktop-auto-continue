@@ -52,9 +52,11 @@ it is not a replay of the original prompt. The watcher calls
 and thread context. This uses Codex's own Goal runtime rather than simulating a
 pixel click or adding a visible user message.
 
-If the app-server call fails, an active Goal falls back to same-thread
-`continue` so work can still progress; the fallback is logged. Paused, blocked,
-completed, or limited Goals are not resumed automatically.
+If a transient turn failure leaves the Goal `blocked` (shown as stalled in
+Desktop), the watcher reactivates it just like the Goal bar's Continue action.
+If the app-server call fails, an active or transiently blocked Goal falls back to
+same-thread `continue` so work can still progress; the fallback is logged.
+Manually paused, completed, or usage-limited Goals are not resumed automatically.
 
 ## Requirements
 

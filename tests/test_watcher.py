@@ -156,6 +156,41 @@ class SessionTests(unittest.TestCase):
         self.assertIsNotNone(action)
         self.assertFalse(action.goal_active)
 
+    def test_reactivates_blocked_goal_after_transient_failure(self):
+        state = MODULE.FileState(
+            offset=0,
+            thread_id=self.thread_id,
+            originator="Codex Desktop",
+        )
+        MODULE.event_action(
+            {
+                "ordinal": 10,
+                "type": "event_msg",
+                "payload": {
+                    "type": "thread_goal_updated",
+                    "goal": {"threadId": self.thread_id, "status": "blocked"},
+                },
+            },
+            state,
+            all_clients=False,
+            path=self.path,
+        )
+        action = MODULE.event_action(
+            {
+                "ordinal": 11,
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "error": {"codex_error_info": "server_overloaded"},
+                },
+            },
+            state,
+            all_clients=False,
+            path=self.path,
+        )
+        self.assertIsNotNone(action)
+        self.assertTrue(action.goal_active)
+
     def test_ignores_cli_session_by_default(self):
         state = MODULE.FileState(offset=0, thread_id=self.thread_id, originator="codex_cli")
         record = {

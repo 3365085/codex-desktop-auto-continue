@@ -239,9 +239,12 @@ def goal_continue(
 ) -> tuple[bool, str]:
     """Ask app-server to continue an existing active Goal without a user message.
 
-    Setting an already-active Goal to ``active`` invokes Codex's own Goal runtime
-    continuation path. When the log did not contain a recent Goal event, first
-    query the current status so a paused/blocked Goal is never resumed by accident.
+    Setting an active or transiently blocked Goal to ``active`` invokes Codex's
+    own Goal runtime continuation path. A transient turn failure can leave a
+    Goal in ``blocked`` (shown as stalled in Desktop), and the Goal Continue
+    control reactivates that state. When the log did not contain a recent Goal
+    event, query the current status so paused, limited, and completed Goals are
+    never resumed by accident.
     """
 
     command = [codex_bin, "app-server", "--listen", "stdio://"]
@@ -299,7 +302,7 @@ def goal_continue(
                 return False, detail
             goal = result.get("goal") if isinstance(result, dict) else None
             current_status = goal.get("status") if isinstance(goal, dict) else None
-            if current_status != "active":
+            if current_status not in {"active", "blocked"}:
                 return False, f"Goal status is {current_status or 'none'}"
 
         request_id = 3 if goal_active is None else 2
@@ -391,7 +394,7 @@ def event_action(
     if not state.goal_seen:
         goal_active = None
     else:
-        goal_active = state.goal_status == "active"
+        goal_active = state.goal_status in {"active", "blocked"}
     return PendingContinuation(event_key, state.thread_id, reason, goal_active=goal_active)
 
 

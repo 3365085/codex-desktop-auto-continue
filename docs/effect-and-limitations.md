@@ -12,7 +12,8 @@ app-server
   thread/goal/set {threadId: <thread-id>, status: "active"}
 ```
 
-This invokes Codex's own Goal runtime continuation path. It has the same
+This invokes Codex's own Goal runtime continuation path. It includes the
+`blocked`/stalled state produced by a transient turn error and has the same
 meaning as the Goal bar's Continue action without inserting a visible user
 message. The existing objective, budget, and thread context are preserved.
 
@@ -42,7 +43,8 @@ non-idempotent operation.
 ## What the watcher does not change
 
 - It does not modify Codex Desktop or the app-server installation. It only uses
-  the app-server protocol to request continuation for an already active Goal.
+  the app-server protocol to request continuation for an active or transiently
+  blocked Goal.
 - It does not change model selection or enable fallback routing.
 - It does not remove Codex's internal reconnect backoff or `1/5` limit.
 - It does not launch or close the Desktop application.

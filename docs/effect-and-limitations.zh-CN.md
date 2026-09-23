@@ -13,7 +13,8 @@ app-server
 ```
 
 这会调用 Codex 自己的 Goal runtime 继续路径，语义对应顶部 Goal 的“继续”，
-但不会在聊天记录里插入一条可见的用户消息。原目标、预算和线程上下文保持不变。
+也包括本轮暂时性错误后 Desktop 显示的 `blocked/目标已停滞` 状态；但不会在
+聊天记录里插入一条可见的用户消息。原目标、预算和线程上下文保持不变。
 
 ### 普通线程
 
@@ -38,7 +39,7 @@ codex queue --thread <原线程ID> --message continue
 ## 不会改变什么
 
 - 不修改 Codex Desktop 或 app-server 的安装文件；仅通过其 app-server 协议请求
-  活动 Goal 继续；
+  活动或暂时性阻塞 Goal 继续；
 - 不改变模型选择，也不启用模型 fallback；
 - 不移除内部重连等待或 `1/5` 限制；失败前的原生等待仍由 Codex 控制；
 - 不启动或关闭 Desktop；
