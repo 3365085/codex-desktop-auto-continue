@@ -1,5 +1,5 @@
 [Unit]
-Description=Continue transiently failed Codex Desktop turns in the same thread
+Description=Continue transiently failed Codex Desktop turns and active Goals
 After=graphical-session.target
 
 [Service]

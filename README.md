@@ -4,8 +4,9 @@
 
 Automatically continue transiently failed **Codex Desktop** turns on the same
 thread. The watcher runs beside the official desktop app on Linux, observes
-new local session events, and queues `continue` when a turn ends because the
-selected model is overloaded or its response stream repeatedly disconnects.
+new local session events, and uses Codex app-server's Goal continuation path
+when an active `/goal` turn ends because the selected model is overloaded or
+its response stream repeatedly disconnects. Ordinary threads queue `continue`.
 
 It does **not** resend the original prompt, create a replacement chat, or route
 the request to another model.
@@ -22,12 +23,11 @@ Codex Desktop turn
         v
 local JSONL session log
         |
-        | watcher extracts the exact thread id
-        v
-codex queue --thread <same-id> --message continue
+        +-- active /goal --> app-server thread/goal/set(status=active)
+        |                    (Goal continuation semantics, no user message)
         |
-        v
-the existing Desktop conversation continues
+        +-- ordinary ------> codex queue --thread <same-id> --message continue
+                             (same Desktop conversation)
 ```
 
 Recognized conditions include:
@@ -41,14 +41,27 @@ Recognized conditions include:
 - `正在重新连接` / `reconnecting` text variants
 
 The default maximum is 10,000 successful automatic continuations per thread.
-No model fallback or model routing is added.
+No model fallback or model routing is added. Goal continuation does not insert
+a visible `continue` user message in the chat.
+
+## Active `/goal` behavior
+
+The Goal bar's Continue operation resumes the same Goal when the thread is idle;
+it is not a replay of the original prompt. The watcher calls
+`thread/goal/set(status=active)` while preserving the existing objective, budget,
+and thread context. This uses Codex's own Goal runtime rather than simulating a
+pixel click or adding a visible user message.
+
+If the app-server call fails, an active Goal falls back to same-thread
+`continue` so work can still progress; the fallback is logged. Paused, blocked,
+completed, or limited Goals are not resumed automatically.
 
 ## Requirements
 
 - Linux with a systemd user session
 - Python 3.10 or newer
-- Codex Desktop / ChatGPT Desktop with the bundled `codex queue` command, or a
-  compatible `codex` executable on `PATH`
+- Codex Desktop / ChatGPT Desktop with the bundled `codex queue` and
+  `codex app-server` commands, or a compatible `codex` executable on `PATH`
 
 No Python packages are required.
 
@@ -81,7 +94,13 @@ Follow its log:
 journalctl --user -u codex-desktop-auto-continue.service -f
 ```
 
-A successful continuation is logged like this:
+An active Goal continuation is logged like this:
+
+```text
+[codex-auto-continue] requested Goal continuation on 019... after server_overloaded (1/10000)
+```
+
+An ordinary-thread continuation is logged like this:
 
 ```text
 [codex-auto-continue] queued 'continue' on 019... after server_overloaded (1/10000)
@@ -102,12 +121,12 @@ Keep that process running while using Codex Desktop.
 - The watcher starts at the end of existing session logs. It handles failures
   written after it starts and does not revive old failed chats by default.
 - It does not interrupt an active turn on `reconnecting 1/5`. Codex's native
-  reconnect sequence is allowed to finish; if the turn finally fails, the
-  watcher queues `continue` on the same thread. This preserves the thread and
-  completed file/tool state, but it does not remove the built-in reconnect
-  delay.
+  reconnect sequence is allowed to finish; if the turn finally fails, an active
+  Goal uses Goal continuation and an ordinary thread queues `continue`. This
+  preserves the thread and completed file/tool state, but it does not remove
+  the built-in reconnect delay.
 - Do not click Desktop's Continue button at the same time as the watcher. Both
-  actions could queue a continuation.
+  actions could request a continuation.
 - The service starts at user login. It waits quietly when Desktop is closed;
   it does not launch Desktop itself.
 
@@ -118,12 +137,13 @@ See [Effect and limitations](docs/effect-and-limitations.md) and
 
 ```text
 --session-root PATH       Session JSONL root; default: CODEX_HOME/sessions
---codex-bin PATH          Executable used for `codex queue`
+--codex-bin PATH          Executable used for `codex queue` and app-server
 --message TEXT            Continuation message; default: continue
 --max-attempts N          Successful continuations per thread; default: 10000
 --max-queue-attempts N    Local queue attempts per failure; default: 10000
 --poll-ms N               File polling interval; default: 100 ms
 --queue-retry-ms N        Delay after a local queue failure; default: 250 ms
+--app-server-timeout-ms N Goal continuation timeout; default: 15000 ms
 --scan-existing           Process historical errors; dangerous on old logs
 --all-clients             Include sessions not created by Codex Desktop
 --dry-run                 Detect and log without queueing a continuation

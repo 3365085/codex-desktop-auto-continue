@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import Iterator, Sequence, TextIO
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 TRANSIENT_CODES = frozenset(
     {
@@ -51,6 +52,8 @@ class FileState:
     partial: bytes = b""
     thread_id: str | None = None
     originator: str | None = None
+    goal_status: str | None = None
+    goal_seen: bool = False
     seen_events: set[str] = field(default_factory=set)
 
 
@@ -59,6 +62,7 @@ class PendingContinuation:
     event_key: str
     thread_id: str
     reason: str
+    goal_active: bool | None = None
     attempts: int = 0
     next_attempt_at: float = 0.0
 
@@ -181,6 +185,148 @@ def queue_continue(codex_bin: str, thread_id: str, message: str) -> tuple[bool, 
     return completed.returncode == 0, detail
 
 
+def _write_json_rpc(stream: TextIO, message: dict[str, object]) -> bool:
+    try:
+        stream.write(json.dumps(message, ensure_ascii=False) + "\n")
+        stream.flush()
+    except (BrokenPipeError, OSError):
+        return False
+    return True
+
+
+def _read_json_rpc_response(
+    stream: TextIO,
+    expected_id: int,
+    deadline: float,
+) -> tuple[bool, object | None, str]:
+    """Read JSON-RPC messages until the response for expected_id arrives."""
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, None, "timed out waiting for app-server response"
+        try:
+            ready, _, _ = select.select([stream], [], [], remaining)
+        except (OSError, ValueError) as exc:
+            return False, None, str(exc)
+        if not ready:
+            return False, None, "timed out waiting for app-server response"
+        line = stream.readline()
+        if not line:
+            return False, None, "app-server closed its protocol stream"
+        try:
+            response = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(response, dict) or response.get("id") != expected_id:
+            continue
+        error = response.get("error")
+        if error is not None:
+            if isinstance(error, dict):
+                message = error.get("message") or error.get("code") or str(error)
+            else:
+                message = str(error)
+            return False, None, f"app-server error: {message}"
+        return True, response.get("result"), ""
+
+
+def goal_continue(
+    codex_bin: str,
+    thread_id: str,
+    *,
+    goal_active: bool | None,
+    timeout_ms: int,
+) -> tuple[bool, str]:
+    """Ask app-server to continue an existing active Goal without a user message.
+
+    Setting an already-active Goal to ``active`` invokes Codex's own Goal runtime
+    continuation path. When the log did not contain a recent Goal event, first
+    query the current status so a paused/blocked Goal is never resumed by accident.
+    """
+
+    command = [codex_bin, "app-server", "--listen", "stdio://"]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+    except OSError as exc:
+        return False, str(exc)
+
+    assert process.stdin is not None
+    assert process.stdout is not None
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    try:
+        initialize = {
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "codex-desktop-auto-continue",
+                    "title": "Codex Desktop Auto Continue",
+                    "version": VERSION,
+                },
+                "capabilities": {"experimentalApi": True},
+            },
+        }
+        if not _write_json_rpc(process.stdin, initialize):
+            return False, "could not write initialize request"
+        ok, _, detail = _read_json_rpc_response(process.stdout, 1, deadline)
+        if not ok:
+            return False, detail
+        if not _write_json_rpc(process.stdin, {"method": "initialized", "params": {}}):
+            return False, "could not write initialized notification"
+
+        current_status: str | None = "active" if goal_active is True else None
+        if current_status is None:
+            if not _write_json_rpc(
+                process.stdin,
+                {
+                    "id": 2,
+                    "method": "thread/goal/get",
+                    "params": {"threadId": thread_id},
+                },
+            ):
+                return False, "could not write thread/goal/get request"
+            ok, result, detail = _read_json_rpc_response(process.stdout, 2, deadline)
+            if not ok:
+                return False, detail
+            goal = result.get("goal") if isinstance(result, dict) else None
+            current_status = goal.get("status") if isinstance(goal, dict) else None
+            if current_status != "active":
+                return False, f"Goal status is {current_status or 'none'}"
+
+        request_id = 3 if goal_active is None else 2
+        if not _write_json_rpc(
+            process.stdin,
+            {
+                "id": request_id,
+                "method": "thread/goal/set",
+                "params": {"threadId": thread_id, "status": "active"},
+            },
+        ):
+            return False, "could not write thread/goal/set request"
+        ok, _, detail = _read_json_rpc_response(process.stdout, request_id, deadline)
+        return (True, "") if ok else (False, detail)
+    finally:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+        try:
+            process.terminate()
+            process.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+            process.wait()
+
+
 def acquire_lock(path: Path) -> TextIO:
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a+", encoding="utf-8")
@@ -217,7 +363,18 @@ def event_action(
     if record.get("type") != "event_msg":
         return None
     payload = record.get("payload")
-    if not isinstance(payload, dict) or payload.get("type") != "task_complete":
+    if not isinstance(payload, dict):
+        return None
+
+    if payload.get("type") == "thread_goal_updated":
+        goal = payload.get("goal")
+        if isinstance(goal, dict):
+            status = goal.get("status")
+            state.goal_status = str(status) if status else None
+            state.goal_seen = True
+        return None
+
+    if payload.get("type") != "task_complete":
         return None
 
     reason = transient_reason(payload.get("error"))
@@ -230,14 +387,19 @@ def event_action(
     if event_key in state.seen_events:
         return None
     state.seen_events.add(event_key)
-    return PendingContinuation(event_key, state.thread_id, reason)
+    goal_active: bool | None
+    if not state.goal_seen:
+        goal_active = None
+    else:
+        goal_active = state.goal_status == "active"
+    return PendingContinuation(event_key, state.thread_id, reason, goal_active=goal_active)
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Queue 'continue' on the same Codex Desktop thread after transient "
-            "overload or response-stream failures."
+            "Continue the same Codex Desktop thread after transient overload or "
+            "response-stream failures. Active Goals use app-server continuation."
         )
     )
     parser.add_argument(
@@ -249,7 +411,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--codex-bin",
         default=shutil.which("codex") or "/usr/lib/chatgpt/resources/codex",
-        help="Codex executable used for 'codex queue'.",
+        help="Codex executable used for queue and Goal app-server calls.",
     )
     parser.add_argument("--message", default="continue", help="Message queued on the thread.")
     parser.add_argument(
@@ -274,6 +436,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Delay after a local queue failure (default: 250 ms).",
     )
     parser.add_argument(
+        "--app-server-timeout-ms",
+        type=int,
+        default=15_000,
+        help="Timeout for an app-server Goal continuation (default: 15000 ms).",
+    )
+    parser.add_argument(
         "--scan-existing",
         action="store_true",
         help="Process historical failures at startup; use with care.",
@@ -291,7 +459,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     for name in ("max_attempts", "max_queue_attempts"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be at least 1")
-    for name in ("poll_ms", "queue_retry_ms"):
+    for name in ("poll_ms", "queue_retry_ms", "app_server_timeout_ms"):
         if getattr(args, name) < 10:
             parser.error(f"--{name.replace('_', '-')} must be at least 10")
     return args
@@ -312,7 +480,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(
         f"[codex-auto-continue] watching {root}; max_attempts={args.max_attempts}; "
-        f"message={args.message!r}; dry_run={args.dry_run}",
+        f"message={args.message!r}; goal_mode=app-server; dry_run={args.dry_run}",
         file=sys.stderr,
         flush=True,
     )
@@ -365,17 +533,74 @@ def main(argv: Sequence[str] | None = None) -> int:
                     del pending[event_key]
                     continue
 
-                if args.dry_run:
+                action.attempts += 1
+                if action.goal_active is False:
                     print(
-                        f"[codex-auto-continue] dry-run: would queue {args.message!r} on "
-                        f"{action.thread_id} after {action.reason}",
+                        f"[codex-auto-continue] Goal is not active for {action.thread_id} "
+                        f"after {action.reason}; leaving it paused/blocked",
                         file=sys.stderr,
                         flush=True,
                     )
                     del pending[event_key]
                     continue
 
-                action.attempts += 1
+                if args.dry_run:
+                    if action.goal_active is True:
+                        print(
+                            f"[codex-auto-continue] dry-run: would request Goal continuation "
+                            f"on {action.thread_id} after {action.reason}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    elif action.goal_active is None:
+                        print(
+                            f"[codex-auto-continue] dry-run: would inspect Goal status for "
+                            f"{action.thread_id}; active => Goal continuation, absent => "
+                            f"queue {args.message!r}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    del pending[event_key]
+                    continue
+
+                if action.goal_active is not False:
+                    operation = "Goal continuation"
+                    ok, detail = goal_continue(
+                        args.codex_bin,
+                        action.thread_id,
+                        goal_active=action.goal_active,
+                        timeout_ms=args.app_server_timeout_ms,
+                    )
+                    if ok:
+                        continuation_counts[action.thread_id] = count + 1
+                        print(
+                            f"[codex-auto-continue] {('dry-run: would request ' if args.dry_run else 'requested ')}"
+                            f"Goal continuation on {action.thread_id} after {action.reason} "
+                            f"({count + 1}/{args.max_attempts})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        del pending[event_key]
+                        continue
+
+                    if action.goal_active is True:
+                        print(
+                            f"[codex-auto-continue] {operation} failed for {action.thread_id}; "
+                            f"falling back to {args.message!r}: {detail}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+
+                    elif detail.startswith("Goal status is ") and not detail.endswith("none"):
+                        print(
+                            f"[codex-auto-continue] {detail} for {action.thread_id}; "
+                            "leaving the Goal unchanged",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        del pending[event_key]
+                        continue
+
                 ok, detail = queue_continue(args.codex_bin, action.thread_id, args.message)
                 if ok:
                     continuation_counts[action.thread_id] = count + 1

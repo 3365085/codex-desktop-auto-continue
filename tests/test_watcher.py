@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -89,6 +90,71 @@ class SessionTests(unittest.TestCase):
         self.assertIsNotNone(action)
         self.assertEqual(action.thread_id, self.thread_id)
         self.assertEqual(action.reason, "server_overloaded")
+        self.assertIsNone(action.goal_active)
+
+    def test_tracks_active_goal_and_marks_failure_for_goal_continuation(self):
+        state = MODULE.FileState(
+            offset=0,
+            thread_id=self.thread_id,
+            originator="Codex Desktop",
+        )
+        goal_event = {
+            "ordinal": 6,
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_goal_updated",
+                "goal": {"threadId": self.thread_id, "status": "active"},
+            },
+        }
+        self.assertIsNone(
+            MODULE.event_action(goal_event, state, all_clients=False, path=self.path)
+        )
+        failure = {
+            "ordinal": 7,
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "error": {"codex_error_info": "server_overloaded"},
+            },
+        }
+        action = MODULE.event_action(failure, state, all_clients=False, path=self.path)
+        self.assertIsNotNone(action)
+        self.assertTrue(action.goal_active)
+
+    def test_does_not_continue_paused_goal(self):
+        state = MODULE.FileState(
+            offset=0,
+            thread_id=self.thread_id,
+            originator="Codex Desktop",
+        )
+        MODULE.event_action(
+            {
+                "ordinal": 6,
+                "type": "event_msg",
+                "payload": {
+                    "type": "thread_goal_updated",
+                    "goal": {"threadId": self.thread_id, "status": "paused"},
+                },
+            },
+            state,
+            all_clients=False,
+            path=self.path,
+        )
+        action = MODULE.event_action(
+            {
+                "ordinal": 7,
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "error": {"codex_error_info": "server_overloaded"},
+                },
+            },
+            state,
+            all_clients=False,
+            path=self.path,
+        )
+        self.assertIsNotNone(action)
+        self.assertFalse(action.goal_active)
 
     def test_ignores_cli_session_by_default(self):
         state = MODULE.FileState(offset=0, thread_id=self.thread_id, originator="codex_cli")
@@ -164,7 +230,7 @@ class SessionTests(unittest.TestCase):
             )
         self.assertEqual(status, 0)
         self.assertIn(
-            f"would queue 'continue' on {self.thread_id} after server_overloaded",
+            f"would inspect Goal status for {self.thread_id}; active => Goal continuation",
             output.getvalue(),
         )
 
@@ -172,6 +238,43 @@ class SessionTests(unittest.TestCase):
         ok, detail = MODULE.queue_continue("/bin/true", self.thread_id, "continue")
         self.assertTrue(ok)
         self.assertEqual(detail, "")
+
+    def test_goal_continue_sets_active_goal_without_queue_message(self):
+        class RecordingStream(io.StringIO):
+            def close(self):
+                self.closed_by_test = True
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = RecordingStream()
+                self.stdout = object()
+                self.terminated = False
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                self.terminated = True
+
+        process = FakeProcess()
+        with patch.object(MODULE.subprocess, "Popen", return_value=process), patch.object(
+            MODULE,
+            "_read_json_rpc_response",
+            side_effect=[(True, {}, ""), (True, {}, "")],
+        ):
+            ok, detail = MODULE.goal_continue(
+                "/fake/codex",
+                self.thread_id,
+                goal_active=True,
+                timeout_ms=1000,
+            )
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        self.assertIn('"method": "thread/goal/set"', process.stdin.getvalue())
+        self.assertNotIn('"method": "thread/goal/get"', process.stdin.getvalue())
 
 
 if __name__ == "__main__":
