@@ -329,6 +329,21 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(MODULE.desktop_unavailable("Desktop inspector did not open on 127.0.0.1:9229"))
         self.assertFalse(MODULE.desktop_unavailable("Goal resume button is not visible"))
 
+    def test_finds_chatgpt_main_in_single_string_cmdline(self):
+        self.assertTrue(
+            MODULE.is_chatgpt_main_command(
+                "ChatGPT", b"/usr/lib/chatgpt/ChatGPT --disable-gpu --enable-logging=stderr"
+            )
+        )
+        self.assertTrue(
+            MODULE.is_chatgpt_main_command(
+                "ChatGPT", b"/usr/lib/chatgpt/ChatGPT\0--disable-gpu\0"
+            )
+        )
+        self.assertFalse(
+            MODULE.is_chatgpt_main_command("ChatGPT", b"/usr/lib/chatgpt/ChatGPT --type=renderer")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

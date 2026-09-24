@@ -209,22 +209,34 @@ def inspector_target(port: int, timeout_ms: int) -> str | None:
     return None
 
 
+def is_chatgpt_main_command(executable: str, raw_cmdline: bytes) -> bool:
+    """Match both NUL-separated and single-string `/proc/cmdline` forms."""
+
+    if executable != "ChatGPT":
+        return False
+    command_line = raw_cmdline.decode("utf-8", errors="replace").replace("\0", " ")
+    return not re.search(r"(?:^|\s)--type=", command_line)
+
+
 def chatgpt_main_pid() -> int | None:
     """Find the Electron main process without matching renderer children."""
 
     for entry in Path("/proc").glob("[0-9]*"):
         try:
             raw = (entry / "cmdline").read_bytes()
+            executable = Path(os.readlink(entry / "exe")).name
         except OSError:
             continue
-        args = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
-        if args and Path(args[0]).name == "ChatGPT" and not any(
-            arg.startswith("--type=") for arg in args[1:]
-        ):
-            try:
-                return int(entry.name)
-            except ValueError:
-                continue
+        if not is_chatgpt_main_command(executable, raw):
+            continue
+        # Most Linux processes expose NUL-separated argv here, but the ChatGPT
+        # launcher used on this machine can expose one complete command string.
+        # Inspect the executable symlink and the raw command text instead of
+        # assuming a particular /proc cmdline representation.
+        try:
+            return int(entry.name)
+        except ValueError:
+            continue
     return None
 
 
