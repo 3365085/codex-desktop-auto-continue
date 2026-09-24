@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Iterator, Sequence, TextIO
 
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 DEFAULT_DESKTOP_UNAVAILABLE_RETRY_MS = 30_000
 
 TRANSIENT_CODES = frozenset(
