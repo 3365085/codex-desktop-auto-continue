@@ -151,6 +151,7 @@ See [Effect and limitations](docs/effect-and-limitations.md) and
 --poll-ms N               File polling interval; default: 100 ms
 --queue-retry-ms N        Delay after a local queue failure; default: 250 ms
 --app-server-timeout-ms N Goal continuation timeout; default: 15000 ms
+--desktop-unavailable-retry-ms N Delay while Desktop is closed; default: 30000 ms
 --inspector-port N        Local Desktop Node inspector port; default: 9229
 --no-desktop-ui           Disable live Desktop buttons and use legacy queue fallback
 --scan-existing           Process historical errors; dangerous on old logs

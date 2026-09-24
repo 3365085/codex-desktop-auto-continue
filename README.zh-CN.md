@@ -136,6 +136,7 @@ python3 codex_desktop_auto_continue.py \
 --poll-ms N                文件轮询间隔；默认 100 毫秒
 --queue-retry-ms N         Desktop/queue 操作失败后的重试间隔；默认 250 毫秒
 --app-server-timeout-ms N  读取线程信息/控制 Desktop 的超时；默认 15000 毫秒
+--desktop-unavailable-retry-ms N  Desktop 关闭时的挂起间隔；默认 30000 毫秒
 --inspector-port N         Desktop 本地 Node inspector 端口；默认 9229
 --no-desktop-ui            禁用真实 Desktop 按钮，使用旧版 queue fallback
 --scan-existing            处理已有错误；对旧日志有误触发风险

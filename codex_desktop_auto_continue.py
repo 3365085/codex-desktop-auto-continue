@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import Iterator, Sequence, TextIO
 
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
+DEFAULT_DESKTOP_UNAVAILABLE_RETRY_MS = 30_000
 
 TRANSIENT_CODES = frozenset(
     {
@@ -71,6 +72,7 @@ class PendingContinuation:
     goal_active: bool | None = None
     attempts: int = 0
     next_attempt_at: float = 0.0
+    desktop_unavailable_logged: bool = False
 
 
 class WebSocketError(RuntimeError):
@@ -479,11 +481,11 @@ def desktop_resume(
 ) -> tuple[bool, str]:
     """Use the same Desktop button the user would click, in the live UI."""
 
-    ok, title, detail = thread_name(codex_bin, thread_id, timeout_ms)
-    if not ok:
-        return False, detail
     target, _, detail = ensure_node_inspector(inspector_port, timeout_ms)
     if not target:
+        return False, f"Desktop unavailable: {detail}"
+    ok, title, detail = thread_name(codex_bin, thread_id, timeout_ms)
+    if not ok:
         return False, detail
     try:
         websocket = InspectorWebSocket(target, timeout_ms / 1000.0)
@@ -533,6 +535,17 @@ def desktop_resume(
             websocket.close()
     except (OSError, WebSocketError, ValueError) as exc:
         return False, str(exc)
+
+
+def desktop_unavailable(detail: str) -> bool:
+    """Identify a missing/starting Desktop without treating it as a fast failure."""
+
+    folded = detail.casefold()
+    return (
+        folded.startswith("desktop unavailable:")
+        or "main process was not found" in folded
+        or "inspector did not open" in folded
+    )
 
 
 def _write_json_rpc(stream: TextIO, message: dict[str, object]) -> bool:
@@ -795,6 +808,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Timeout for Desktop metadata and inspector calls (default: 15000 ms).",
     )
     parser.add_argument(
+        "--desktop-unavailable-retry-ms",
+        type=int,
+        default=DEFAULT_DESKTOP_UNAVAILABLE_RETRY_MS,
+        help="Delay while Desktop is closed/unavailable (default: 30000 ms).",
+    )
+    parser.add_argument(
         "--inspector-port",
         type=int,
         default=9229,
@@ -823,7 +842,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     for name in ("max_attempts", "max_queue_attempts"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be at least 1")
-    for name in ("poll_ms", "queue_retry_ms", "app_server_timeout_ms"):
+    for name in (
+        "poll_ms",
+        "queue_retry_ms",
+        "app_server_timeout_ms",
+        "desktop_unavailable_retry_ms",
+    ):
         if getattr(args, name) < 10:
             parser.error(f"--{name.replace('_', '-')} must be at least 10")
     if args.inspector_port < 1 or args.inspector_port > 65535:
@@ -948,6 +972,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                             flush=True,
                         )
                         del pending[event_key]
+                        continue
+
+                    if desktop_unavailable(detail):
+                        action.attempts -= 1
+                        action.next_attempt_at = (
+                            now + args.desktop_unavailable_retry_ms / 1000.0
+                        )
+                        if not action.desktop_unavailable_logged:
+                            print(
+                                f"[codex-auto-continue] Desktop is unavailable for "
+                                f"{action.thread_id}; pausing this event for "
+                                f"{args.desktop_unavailable_retry_ms} ms: {detail}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            action.desktop_unavailable_logged = True
                         continue
 
                     if action.goal_active is True:

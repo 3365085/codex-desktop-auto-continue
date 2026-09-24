@@ -322,6 +322,12 @@ class SessionTests(unittest.TestCase):
         args = MODULE.parse_args([])
         self.assertFalse(args.no_desktop_ui)
         self.assertEqual(args.inspector_port, 9229)
+        self.assertEqual(args.desktop_unavailable_retry_ms, 30000)
+
+    def test_missing_desktop_is_a_paused_condition(self):
+        self.assertTrue(MODULE.desktop_unavailable("Desktop unavailable: Codex Desktop main process was not found"))
+        self.assertTrue(MODULE.desktop_unavailable("Desktop inspector did not open on 127.0.0.1:9229"))
+        self.assertFalse(MODULE.desktop_unavailable("Goal resume button is not visible"))
 
 
 if __name__ == "__main__":
