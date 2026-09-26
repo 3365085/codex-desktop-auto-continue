@@ -24,7 +24,7 @@ Codex Desktop 原线程
                            （重试失败轮次，保留原线程状态）
 ```
 
-只有在 Desktop 按钮不可用且没有活动 Goal 时，才会回退为同线程 `codex queue --message continue`；日志会明确写出 fallback。活动 Goal 不会被这种回退消息污染，而是保留事件并继续尝试点击“恢复目标”。
+只有在 Desktop 按钮出现明确的非 UI 操作错误、且没有活动 Goal 时，才会回退为同线程 `codex queue --message continue`；日志会明确写出 fallback。如果线程还没有渲染在 Desktop 左侧列表，或官方按钮暂时没有出现，事件会保留在原线程中并等待 UI 就绪，不会发送新的消息。活动 Goal 始终不会被回退消息污染，而是保留事件继续尝试点击“恢复目标”。
 
 默认识别：
 
@@ -137,6 +137,7 @@ python3 codex_desktop_auto_continue.py \
 --queue-retry-ms N         Desktop/queue 操作失败后的重试间隔；默认 250 毫秒
 --app-server-timeout-ms N  读取线程信息/控制 Desktop 的超时；默认 15000 毫秒
 --desktop-unavailable-retry-ms N  Desktop 关闭时的挂起间隔；默认 30000 毫秒
+--desktop-ui-retry-ms N         Desktop 线程/按钮未渲染时的等待间隔；默认 5000 毫秒
 --inspector-port N         Desktop 本地 Node inspector 端口；默认 9229
 --no-desktop-ui            禁用真实 Desktop 按钮，使用旧版 queue fallback
 --scan-existing            处理已有错误；对旧日志有误触发风险

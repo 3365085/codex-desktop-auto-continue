@@ -323,11 +323,22 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(args.no_desktop_ui)
         self.assertEqual(args.inspector_port, 9229)
         self.assertEqual(args.desktop_unavailable_retry_ms, 30000)
+        self.assertEqual(args.desktop_ui_retry_ms, 5000)
 
     def test_missing_desktop_is_a_paused_condition(self):
         self.assertTrue(MODULE.desktop_unavailable("Desktop unavailable: Codex Desktop main process was not found"))
         self.assertTrue(MODULE.desktop_unavailable("Desktop inspector did not open on 127.0.0.1:9229"))
         self.assertFalse(MODULE.desktop_unavailable("Goal resume button is not visible"))
+
+    def test_desktop_ui_missing_button_is_a_paused_condition(self):
+        self.assertTrue(
+            MODULE.desktop_ui_unavailable(
+                "Desktop thread is not visible in the sidebar: A thread"
+            )
+        )
+        self.assertTrue(MODULE.desktop_ui_unavailable("Goal resume button is not visible"))
+        self.assertTrue(MODULE.desktop_ui_unavailable("Desktop retry button is not visible"))
+        self.assertFalse(MODULE.desktop_ui_unavailable("Desktop inspector timed out"))
 
     def test_finds_chatgpt_main_in_single_string_cmdline(self):
         self.assertTrue(

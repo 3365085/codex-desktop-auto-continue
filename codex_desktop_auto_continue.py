@@ -24,8 +24,9 @@ from pathlib import Path
 from typing import Iterator, Sequence, TextIO
 
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 DEFAULT_DESKTOP_UNAVAILABLE_RETRY_MS = 30_000
+DEFAULT_DESKTOP_UI_RETRY_MS = 5_000
 
 TRANSIENT_CODES = frozenset(
     {
@@ -73,6 +74,7 @@ class PendingContinuation:
     attempts: int = 0
     next_attempt_at: float = 0.0
     desktop_unavailable_logged: bool = False
+    desktop_ui_wait_logged: bool = False
 
 
 class WebSocketError(RuntimeError):
@@ -560,6 +562,23 @@ def desktop_unavailable(detail: str) -> bool:
     )
 
 
+def desktop_ui_unavailable(detail: str) -> bool:
+    """Identify a live Desktop UI that is not currently addressable.
+
+    This is different from a formal turn failure: the event must remain pending
+    until the same Desktop thread and its official button can be found. In
+    particular, Electron may have the thread open but not render it in the
+    virtualized sidebar yet.
+    """
+
+    folded = detail.casefold()
+    return (
+        "thread is not visible in the sidebar" in folded
+        or "goal resume button is not visible" in folded
+        or "desktop retry button is not visible" in folded
+    )
+
+
 def _write_json_rpc(stream: TextIO, message: dict[str, object]) -> bool:
     try:
         stream.write(json.dumps(message, ensure_ascii=False) + "\n")
@@ -826,6 +845,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Delay while Desktop is closed/unavailable (default: 30000 ms).",
     )
     parser.add_argument(
+        "--desktop-ui-retry-ms",
+        type=int,
+        default=DEFAULT_DESKTOP_UI_RETRY_MS,
+        help="Delay while the Desktop thread/button is not rendered (default: 5000 ms).",
+    )
+    parser.add_argument(
         "--inspector-port",
         type=int,
         default=9229,
@@ -859,6 +884,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "queue_retry_ms",
         "app_server_timeout_ms",
         "desktop_unavailable_retry_ms",
+        "desktop_ui_retry_ms",
     ):
         if getattr(args, name) < 10:
             parser.error(f"--{name.replace('_', '-')} must be at least 10")
@@ -1002,21 +1028,35 @@ def main(argv: Sequence[str] | None = None) -> int:
                             action.desktop_unavailable_logged = True
                         continue
 
-                    if action.goal_active is True:
-                        print(
-                            f"[codex-auto-continue] Desktop Goal button was not usable for "
-                            f"{action.thread_id}; will retry without sending a new message: {detail}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        action.next_attempt_at = now + args.queue_retry_ms / 1000.0
-                        if action.attempts == 1 or action.attempts % 100 == 0:
+                    if desktop_ui_unavailable(detail):
+                        # This is a UI-readiness condition, not a retryable
+                        # server failure. Keep the original event pending and
+                        # never replace the official Desktop action with a new
+                        # user message while the thread is not rendered.
+                        action.attempts -= 1
+                        action.next_attempt_at = now + args.desktop_ui_retry_ms / 1000.0
+                        if not action.desktop_ui_wait_logged:
                             print(
-                                f"[codex-auto-continue] Desktop Goal retry attempt "
-                                f"{action.attempts} for {action.thread_id}",
+                                f"[codex-auto-continue] Desktop thread/button is not "
+                                f"currently visible for {action.thread_id}; pausing this "
+                                f"event for {args.desktop_ui_retry_ms} ms: {detail}",
                                 file=sys.stderr,
                                 flush=True,
                             )
+                            action.desktop_ui_wait_logged = True
+                        continue
+
+                    if action.goal_active is True:
+                        action.next_attempt_at = now + args.desktop_ui_retry_ms / 1000.0
+                        if not action.desktop_ui_wait_logged:
+                            print(
+                                f"[codex-auto-continue] Desktop Goal button was not usable for "
+                                f"{action.thread_id}; pausing this event for "
+                                f"{args.desktop_ui_retry_ms} ms without sending a new message: {detail}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            action.desktop_ui_wait_logged = True
                         continue
 
                     print(

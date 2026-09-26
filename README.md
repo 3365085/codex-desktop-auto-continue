@@ -32,7 +32,10 @@ local JSONL session log
 
 If the Desktop button is unavailable and the thread has no active Goal, the
 watcher logs an explicit fallback and queues `continue` on the same thread.
-Active Goals remain pending until the real Desktop Goal button can be clicked.
+When the thread or official button is temporarily not rendered in Desktop, the
+event is kept pending and retried after a short UI-readiness delay; it does not
+send a new message. Active Goals always remain pending until the real Desktop
+Goal button can be clicked.
 
 Recognized conditions include:
 
@@ -152,6 +155,7 @@ See [Effect and limitations](docs/effect-and-limitations.md) and
 --queue-retry-ms N        Delay after a local queue failure; default: 250 ms
 --app-server-timeout-ms N Goal continuation timeout; default: 15000 ms
 --desktop-unavailable-retry-ms N Delay while Desktop is closed; default: 30000 ms
+--desktop-ui-retry-ms N       Delay while the thread/button is not rendered; default: 5000 ms
 --inspector-port N        Local Desktop Node inspector port; default: 9229
 --no-desktop-ui           Disable live Desktop buttons and use legacy queue fallback
 --scan-existing           Process historical errors; dangerous on old logs
