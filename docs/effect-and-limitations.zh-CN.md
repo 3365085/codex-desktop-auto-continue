@@ -22,14 +22,15 @@ Desktop 窗口 → 目标栏“恢复目标”
 Desktop 窗口 → 失败卡片“重试”
 ```
 
-这是官方针对失败轮次的重试动作，不是重新发送原始问题。只有 Desktop 按钮不可用
-且没有活动 Goal 时，才会回退为：
+这是官方针对失败轮次的重试动作，不是重新发送原始问题。旧版 queue 路径只有
+显式传入 `--no-desktop-ui` 才会启用：
 
 ```text
 codex queue --thread <原线程ID> --message continue
 ```
 
-这个 fallback 会在日志中明确记录。活动 Goal 不会降级为新的 `continue` 用户消息。
+正常 Desktop 模式会保留原失败事件，等待官方按钮出现，不会发送新的 `continue`
+用户消息。为寻找后台线程按钮而临时切换后，服务会把界面切回恢复前用户选中的线程。
 
 ## 为什么不直接调用 app-server Goal API
 

@@ -30,12 +30,13 @@ local JSONL session log
                              (same Desktop conversation and failed turn)
 ```
 
-If the Desktop button is unavailable and the thread has no active Goal, the
-watcher logs an explicit fallback and queues `continue` on the same thread.
-When the thread or official button is temporarily not rendered in Desktop, the
-event is kept pending and retried after a short UI-readiness delay; it does not
-send a new message. Active Goals always remain pending until the real Desktop
-Goal button can be clicked.
+If the Desktop button is unavailable, the event stays pending and is retried
+after a short UI-readiness delay. The normal Desktop service never queues a
+`continue` message: that would be a new user turn rather than the official
+failed-turn/Goal action. When it temporarily opens a background thread to find
+the button, it restores the thread that was selected before recovery so the
+user's view is not stolen. The legacy queue behavior is available only through
+the explicit `--no-desktop-ui` option.
 
 Recognized conditions include:
 
@@ -157,7 +158,7 @@ See [Effect and limitations](docs/effect-and-limitations.md) and
 --desktop-unavailable-retry-ms N Delay while Desktop is closed; default: 30000 ms
 --desktop-ui-retry-ms N       Delay while the thread/button is not rendered; default: 5000 ms
 --inspector-port N        Local Desktop Node inspector port; default: 9229
---no-desktop-ui           Disable live Desktop buttons and use legacy queue fallback
+--no-desktop-ui           Explicitly use the legacy queue fallback (not recommended)
 --scan-existing           Process historical errors; dangerous on old logs
 --all-clients             Include sessions not created by Codex Desktop
 --dry-run                 Detect and log without queueing a continuation

@@ -30,7 +30,7 @@ future failures will be observed.
 Avoid `--scan-existing` on the normal session root because it can revive many
 old failed chats.
 
-## `codex queue` fails
+## Legacy `codex queue` fallback
 
 Confirm that Desktop is open and that the selected executable supports the
 command:
@@ -39,8 +39,9 @@ command:
 /usr/lib/chatgpt/resources/codex queue --help
 ```
 
-The watcher retries local queue failures using a fixed short delay and never
-switches models.
+This path is used only when `--no-desktop-ui` is explicitly supplied. Normal
+Desktop mode keeps the event pending and retries the official Desktop button
+instead of sending a new message; it never switches models.
 
 ## No log entry after `reconnecting 1/5`
 

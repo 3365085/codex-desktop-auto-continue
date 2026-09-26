@@ -316,7 +316,55 @@ class SessionTests(unittest.TestCase):
         self.assertIn("恢复目标", script)
         self.assertIn("暂停目标", script)
         self.assertIn("重试", script)
+        self.assertIn("Continue", script)
+        self.assertIn("continue", script)
         self.assertIn("A thread", script)
+        self.assertIn("data-app-action-sidebar-thread-selected=\"true\"", script)
+        self.assertIn("Could not restore the previously selected Desktop thread", script)
+        self.assertIn("source.click()", script)
+
+    def test_desktop_failure_does_not_fallback_to_queue_message(self):
+        self.write_records(
+            [
+                {
+                    "ordinal": 0,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": self.thread_id,
+                        "session_id": self.thread_id,
+                        "originator": "Codex Desktop",
+                    },
+                },
+                {
+                    "ordinal": 1,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "error": {"codex_error_info": "server_overloaded"},
+                    },
+                },
+            ]
+        )
+        output = io.StringIO()
+        lock_file = self.root / "watcher.lock"
+        with redirect_stderr(output), patch.object(
+            MODULE, "desktop_resume", return_value=(False, "Desktop retry button is not visible")
+        ) as resume, patch.object(MODULE, "queue_continue") as queue:
+            status = MODULE.main(
+                [
+                    "--session-root",
+                    str(self.root),
+                    "--scan-existing",
+                    "--once",
+                    "--lock-file",
+                    str(lock_file),
+                ]
+            )
+        self.assertEqual(status, 0)
+        resume.assert_called_once()
+        queue.assert_not_called()
+        self.assertIn("pausing this event", output.getvalue())
+        self.assertNotIn("falling back", output.getvalue())
 
     def test_desktop_options_default_to_live_ui(self):
         args = MODULE.parse_args([])

@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Iterator, Sequence, TextIO
 
 
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 DEFAULT_DESKTOP_UNAVAILABLE_RETRY_MS = 30_000
 DEFAULT_DESKTOP_UI_RETRY_MS = 5_000
 
@@ -453,10 +453,45 @@ def _desktop_renderer_script(thread_title: str, prefer_goal: bool, wait_ms: int)
   const visible = (element) => !!element && !!element.offsetParent;
   const aria = (value) => [...document.querySelectorAll('[aria-label]')]
     .find((element) => visible(element) && element.getAttribute('aria-label') === value);
+  const selectedThread = () => [...document.querySelectorAll(
+    '[data-app-action-sidebar-thread-selected="true"], [aria-current="page"]'
+  )].find((element) => visible(element));
+  const selected = selectedThread();
+  const sourceTitle = selected
+    ? (selected.getAttribute('aria-label') || selected.getAttribute('data-app-action-sidebar-thread-title'))
+    : null;
+  const sourceId = selected?.getAttribute('data-app-action-sidebar-thread-id');
+  const findSource = () => sourceId
+    ? [...document.querySelectorAll('[data-app-action-sidebar-thread-id]')]
+      .find((element) => element.getAttribute('data-app-action-sidebar-thread-id') === sourceId)
+    : [...document.querySelectorAll('[aria-label]')]
+      .find((element) => element.getAttribute('aria-label') === sourceTitle);
+  const restoreSource = async () => {{
+    if (!sourceTitle || sourceTitle === title) return true;
+    let source = findSource();
+    if (!source) return false;
+    source.scrollIntoView?.({{block: 'nearest'}});
+    await wait(50);
+    source = aria(sourceTitle) || source;
+    if (!visible(source)) return false;
+    source.click();
+    await wait(150);
+    return true;
+  }};
+  const result = async (value) => {{
+    const restored = await restoreSource();
+    if (!restored) return {{ok: false, detail: 'Could not restore the previously selected Desktop thread: ' + sourceTitle}};
+    return value;
+  }};
+  if (!sourceTitle) {{
+    return {{ok: false, detail: 'Could not identify the currently selected Desktop thread; refusing to switch the UI'}};
+  }}
   const thread = aria(title);
   if (thread) {{
-    thread.click();
-    await wait({wait_ms});
+    if (sourceTitle !== title) {{
+      thread.click();
+      await wait({wait_ms});
+    }}
   }} else if (!document.body.innerText.includes(title)) {{
     return {{ok: false, detail: 'Desktop thread is not visible in the sidebar: ' + title}};
   }}
@@ -464,23 +499,25 @@ def _desktop_renderer_script(thread_title: str, prefer_goal: bool, wait_ms: int)
   const restore = aria('恢复目标');
   if (restore) {{
     restore.click();
-    return {{ok: true, action: 'resume-goal'}};
+    return await result({{ok: true, action: 'resume-goal'}});
   }}
   const pause = aria('暂停目标');
   if (pause) {{
-    return {{ok: true, action: 'goal-already-active'}};
+    return await result({{ok: true, action: 'goal-already-active'}});
   }}
   if (preferGoal) {{
-    return {{ok: false, detail: 'Goal resume button is not visible'}};
+    return await result({{ok: false, detail: 'Goal resume button is not visible'}});
   }}
 
   const retry = [...document.querySelectorAll('button')]
-    .find((element) => visible(element) && ['重试', 'Retry', 'retry'].includes(element.innerText.trim()));
+    .find((element) => visible(element) && [
+      '重试', 'Retry', 'retry', '继续', 'Continue', 'continue'
+    ].includes(element.innerText.trim()));
   if (retry) {{
     retry.click();
-    return {{ok: true, action: 'retry-failed-turn'}};
+    return await result({{ok: true, action: 'retry-failed-turn'}});
   }}
-  return {{ok: false, detail: 'Desktop retry button is not visible'}};
+  return await result({{ok: false, detail: 'Desktop retry button is not visible'}});
 }})()
 """
 
@@ -859,7 +896,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--no-desktop-ui",
         action="store_true",
-        help="Disable live Desktop button control and use the legacy queue fallback.",
+        help="Explicitly disable live Desktop buttons and use the legacy queue fallback.",
     )
     parser.add_argument(
         "--scan-existing",
@@ -985,7 +1022,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         print(
                             f"[codex-auto-continue] dry-run: would inspect Goal status for "
                             f"{action.thread_id}; active => Goal continuation (click 恢复目标), "
-                            f"no Goal => click 重试 (fallback: queue {args.message!r})",
+                            f"no Goal => click 重试 (no message fallback)",
                             file=sys.stderr,
                             flush=True,
                         )
@@ -1046,25 +1083,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                             action.desktop_ui_wait_logged = True
                         continue
 
-                    if action.goal_active is True:
-                        action.next_attempt_at = now + args.desktop_ui_retry_ms / 1000.0
-                        if not action.desktop_ui_wait_logged:
-                            print(
-                                f"[codex-auto-continue] Desktop Goal button was not usable for "
-                                f"{action.thread_id}; pausing this event for "
-                                f"{args.desktop_ui_retry_ms} ms without sending a new message: {detail}",
-                                file=sys.stderr,
-                                flush=True,
-                            )
-                            action.desktop_ui_wait_logged = True
-                        continue
-
-                    print(
-                        f"[codex-auto-continue] Desktop retry button failed for "
-                        f"{action.thread_id}; falling back to {args.message!r}: {detail}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                    # Every Desktop-originated failure must use the live Desktop
+                    # control. A queue message is a new turn and can mutate or
+                    # lose the stateful conversation/Goal context, so keep the
+                    # original event pending for the next button attempt.
+                    action.next_attempt_at = now + args.desktop_ui_retry_ms / 1000.0
+                    if not action.desktop_ui_wait_logged:
+                        print(
+                            f"[codex-auto-continue] Desktop official retry/Goal button "
+                            f"was not usable for {action.thread_id}; pausing this event for "
+                            f"{args.desktop_ui_retry_ms} ms without sending a new message: {detail}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        action.desktop_ui_wait_logged = True
+                    continue
 
                 elif action.goal_active is True and not args.no_desktop_ui:
                     action.next_attempt_at = now + args.queue_retry_ms / 1000.0

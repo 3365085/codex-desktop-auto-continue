@@ -58,9 +58,9 @@ systemctl --user restart codex-desktop-auto-continue.service
 /usr/lib/chatgpt/resources/codex queue --help
 ```
 
-只有没有活动 Goal 且 Desktop 的普通“重试”按钮不可用时才会进入这个 fallback。
-监视器会以固定的短间隔重试本地排队操作，不会切换模型。要强制使用旧行为可
-显式传入 `--no-desktop-ui`，但这不会点击 Desktop 官方按钮。
+只有显式传入 `--no-desktop-ui` 才会进入这个旧版 fallback。正常 Desktop 模式会
+保留事件并继续寻找官方“重试/恢复目标”按钮，不会发送新的消息，也不会切换模型。
+这个选项只用于临时复现旧行为，不会点击 Desktop 官方按钮。
 
 ## `正在重新连接 1/5` 后没有日志
 
