@@ -58,9 +58,8 @@ systemctl --user restart codex-desktop-auto-continue.service
 /usr/lib/chatgpt/resources/codex queue --help
 ```
 
-只有显式传入 `--no-desktop-ui` 才会进入这个旧版 fallback。正常 Desktop 模式会
-保留事件并继续寻找官方“重试/恢复目标”按钮，不会发送新的消息，也不会切换模型。
-这个选项只用于临时复现旧行为，不会点击 Desktop 官方按钮。
+安装后的服务本来就使用这个 queue-only 路径：它向同一个线程发送 `continue`，不打开
+Desktop UI，因此不会切换你正在看的会话。聊天中出现可见的 `continue` 消息是预期行为。
 
 ## `正在重新连接 1/5` 后没有日志
 

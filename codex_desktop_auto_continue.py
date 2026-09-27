@@ -1011,7 +1011,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     continue
 
                 if args.dry_run:
-                    if action.goal_active is True:
+                    if args.no_desktop_ui:
+                        print(
+                            f"[codex-auto-continue] dry-run: would queue "
+                            f"{args.message!r} on {action.thread_id} without Desktop UI",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    elif action.goal_active is True:
                         print(
                             f"[codex-auto-continue] dry-run: would click the Desktop Goal "
                             f"continuation button on {action.thread_id} after {action.reason}",
@@ -1113,26 +1120,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     del pending[event_key]
                     continue
 
-                if action.goal_active is not False and args.no_desktop_ui:
-                    operation = "Goal continuation"
-                    ok, detail = goal_continue(
-                        args.codex_bin,
-                        action.thread_id,
-                        goal_active=action.goal_active,
-                        timeout_ms=args.app_server_timeout_ms,
-                    )
-                    if ok:
-                        continuation_counts[action.thread_id] = count + 1
-                        print(
-                            f"[codex-auto-continue] requested legacy {operation} on "
-                            f"{action.thread_id} after {action.reason} "
-                            f"({count + 1}/{args.max_attempts})",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        del pending[event_key]
-                        continue
-
+                # Queue-only mode deliberately sends a same-thread `continue`
+                # message for every active/transient failure. It never opens
+                # Electron inspector or changes the Desktop-selected thread.
                 ok, detail = queue_continue(args.codex_bin, action.thread_id, args.message)
                 if ok:
                     continuation_counts[action.thread_id] = count + 1

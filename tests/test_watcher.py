@@ -366,6 +366,60 @@ class SessionTests(unittest.TestCase):
         self.assertIn("pausing this event", output.getvalue())
         self.assertNotIn("falling back", output.getvalue())
 
+    def test_no_desktop_ui_queues_continue_without_goal_api(self):
+        self.write_records(
+            [
+                {
+                    "ordinal": 0,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": self.thread_id,
+                        "session_id": self.thread_id,
+                        "originator": "Codex Desktop",
+                    },
+                },
+                {
+                    "ordinal": 1,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_goal_updated",
+                        "goal": {"threadId": self.thread_id, "status": "active"},
+                    },
+                },
+                {
+                    "ordinal": 2,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "error": {"codex_error_info": "server_overloaded"},
+                    },
+                },
+            ]
+        )
+        output = io.StringIO()
+        lock_file = self.root / "watcher.lock"
+        with redirect_stderr(output), patch.object(
+            MODULE, "goal_continue", side_effect=AssertionError("Goal API must not run")
+        ) as goal_api, patch.object(
+            MODULE, "queue_continue", return_value=(True, "")
+        ) as queue:
+            status = MODULE.main(
+                [
+                    "--session-root",
+                    str(self.root),
+                    "--scan-existing",
+                    "--once",
+                    "--no-desktop-ui",
+                    "--lock-file",
+                    str(lock_file),
+                ]
+            )
+        self.assertEqual(status, 0)
+        goal_api.assert_not_called()
+        queue.assert_called_once()
+        self.assertEqual(queue.call_args.args[1:], (self.thread_id, "continue"))
+        self.assertIn("queued 'continue'", output.getvalue())
+
     def test_desktop_options_default_to_live_ui(self):
         args = MODULE.parse_args([])
         self.assertFalse(args.no_desktop_ui)

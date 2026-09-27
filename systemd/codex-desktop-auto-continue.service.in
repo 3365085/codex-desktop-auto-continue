@@ -1,10 +1,10 @@
 [Unit]
-Description=Click Codex Desktop retry and Goal-resume buttons after transient failures
+Description=Queue same-thread continue messages after transient Codex failures
 After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=@PYTHON@ @WATCHER@ --codex-bin @CODEX_BIN@ --max-attempts 10000
+ExecStart=@PYTHON@ @WATCHER@ --codex-bin @CODEX_BIN@ --max-attempts 10000 --no-desktop-ui
 Restart=on-failure
 RestartSec=1
 UMask=0077

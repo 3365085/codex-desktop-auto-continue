@@ -2,9 +2,14 @@
 
 [English](README.md)
 
-这个项目在 Linux 上为官方 **Codex Desktop** 提供同线程自动继续能力。它监视本机新增的 Codex 会话事件；当某一轮因为模型满载、响应流断开或内部重连耗尽而正式失败时，监视器取得原线程的标题，并通过本机 Desktop 窗口执行官方按钮：`/goal` 线程点击顶部“恢复目标”，普通线程点击错误卡片的“重试”。
+这个项目在 Linux 上为官方 **Codex Desktop** 提供同线程自动继续能力。当前安装的
+systemd 服务采用 queue-only 模式：当某一轮因为模型满载、响应流断开或内部重连耗尽
+而正式失败时，向原线程发送 `continue`，不打开 Electron inspector，也不点击或切换
+Desktop 会话。
 
-这是真正的 Desktop 动作，不是另起一个 CLI 会话，也不是向聊天框插入一条黑色的 `continue` 消息。它不会重新发送原始问题，不会创建替代聊天，也不会把任务路由到其他模型。
+这不是另起一个 CLI 会话，而是向同一个线程排队一条 `continue` 消息。它不会重新发送
+原始问题，不会创建替代聊天，也不会把任务路由到其他模型。代价是这条消息会出现在
+对话中，但不会打断你当前正在看的会话。
 
 > 这是独立的社区项目，并非 OpenAI 官方产品，也不代表 OpenAI。
 
@@ -17,14 +22,13 @@ Codex Desktop 原线程
         ▼
 本机 JSONL 会话日志
         │
-        ├─ 活动 /goal ──► Desktop 顶部“恢复目标”
-        │                  （原 Goal runtime 继续，不新增用户消息）
-        │
-        └─ 普通线程 ────► Desktop 错误卡片“重试”
-                           （重试失败轮次，保留原线程状态）
+        └─ 任意暂时性失败 ──► 原线程 queue `continue`
+                               （不操作 Desktop 界面）
 ```
 
-正常的 Desktop 服务不会回退发送 `continue` 消息：官方“恢复目标/重试”按钮暂时不可见时，原失败事件会保留并按短间隔继续寻找按钮。服务如果临时打开后台线程来点击按钮，完成动作后会把界面切回恢复前用户正在看的会话，不会抢走当前视图。只有显式传入 `--no-desktop-ui` 才启用旧版 queue fallback；默认不启用。
+安装后的服务不会点击官方按钮，也不会为了恢复后台线程而切换界面。它直接向原线程
+发送 `continue`；queue 失败时按短间隔重试。手动运行脚本且不传 `--no-desktop-ui` 时，
+仍可使用 Desktop 按钮模式，但不建议在需要保持当前视图时使用。
 
 默认识别：
 
@@ -139,7 +143,7 @@ python3 codex_desktop_auto_continue.py \
 --desktop-unavailable-retry-ms N  Desktop 关闭时的挂起间隔；默认 30000 毫秒
 --desktop-ui-retry-ms N         Desktop 线程/按钮未渲染时的等待间隔；默认 5000 毫秒
 --inspector-port N         Desktop 本地 Node inspector 端口；默认 9229
---no-desktop-ui            明确禁用真实 Desktop 按钮，使用旧版 queue fallback（不推荐）
+--no-desktop-ui            使用同线程 queue continue，不操作 Desktop 界面
 --scan-existing            处理已有错误；对旧日志有误触发风险
 --all-clients              同时处理非 Desktop 会话
 --dry-run                  只检测和记录，不发送动作

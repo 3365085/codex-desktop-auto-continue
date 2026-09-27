@@ -3,34 +3,16 @@
 ## 同线程继续
 
 Codex 会话日志的元数据包含稳定的线程 ID。某轮以受支持的暂时性错误结束后，
-监视器读取同一个线程的 Desktop 标题，通过本地 Electron inspector 选中该
-线程，然后执行与用户相同的按钮动作：
-
-### 活动 `/goal`
-
-```text
-Desktop 窗口 → 目标栏“恢复目标”
-```
-
-这会恢复同一个 Goal runtime，不会在聊天记录里插入可见的用户消息；原目标、
-预算、工具上下文和已经落盘的文件修改仍属于原线程。`blocked`/“目标已停滞”
-也使用同一个按钮恢复。
-
-### 普通线程
-
-```text
-Desktop 窗口 → 失败卡片“重试”
-```
-
-这是官方针对失败轮次的重试动作，不是重新发送原始问题。旧版 queue 路径只有
-显式传入 `--no-desktop-ui` 才会启用：
+安装后的服务直接向同一个线程发送 queue `continue`，不读取 Desktop 标题，不打开
+Electron inspector，也不切换当前选中的会话：
 
 ```text
 codex queue --thread <原线程ID> --message continue
 ```
 
-正常 Desktop 模式会保留原失败事件，等待官方按钮出现，不会发送新的 `continue`
-用户消息。为寻找后台线程按钮而临时切换后，服务会把界面切回恢复前用户选中的线程。
+这条消息属于原聊天线程，不会切换 Desktop 当前会话。代价是聊天记录中会出现一条
+可见的 `continue`，但不会打断你正在查看的另一个对话。手动运行脚本且不传
+`--no-desktop-ui` 时才会启用 Desktop 官方按钮模式。
 
 ## 为什么不直接调用 app-server Goal API
 
@@ -53,7 +35,7 @@ app-server 连接；因此不会创建 Desktop 的新 turn。包装器仍然使�
 
 ## 不会改变什么
 
-- 不修改 Codex Desktop 或 app-server 的安装文件；
+- 不修改 Codex Desktop 或 app-server 的安装文件，也不会由安装后的服务操作 Desktop UI；
 - 不改变模型选择，也不启用模型 fallback；
 - 不删除 Desktop 内部 `1/5` 重连等待；包装器只在正式的 `task_complete.error`
   之后立即点击官方按钮；
@@ -67,11 +49,8 @@ app-server 内部实现，而不是这个外部包装器。
 
 ## 本地 inspector 安全边界
 
-需要点击 UI 时，监视器向当前 Electron 主进程发送 `SIGUSR1`，让 Node inspector
-监听 `127.0.0.1:9229`。它只接受本机连接，不开放到局域网；使用同一用户的
-Desktop 和 systemd 服务是必要条件。若组织策略禁止 Node inspector，可使用
-`--no-desktop-ui`，但这会退回旧版 queue 行为，不再保证 Desktop 的官方按钮
-语义。
+手动启用 Desktop 按钮模式时，监视器才会向当前 Electron 主进程发送 `SIGUSR1`。
+安装后的 queue-only 服务不需要 Node inspector。
 
 ## 并发注意事项
 

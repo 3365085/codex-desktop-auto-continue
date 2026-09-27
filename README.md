@@ -3,10 +3,9 @@
 [简体中文](README.zh-CN.md)
 
 Automatically continue transiently failed **Codex Desktop** turns on the same
-thread. The watcher runs beside the official desktop app on Linux, observes
-new local session events, and clicks the live Desktop Goal-resume or failed-turn
-Retry button. It does not create a separate CLI turn or insert a visible
-`continue` message.
+thread. The installed systemd service uses a queue-only recovery path: it sends
+the same-thread `continue` message and never selects another Desktop
+conversation. This avoids stealing focus from the conversation you are using.
 
 It does **not** resend the original prompt, create a replacement chat, or route
 the request to another model.
@@ -23,20 +22,15 @@ Codex Desktop turn
         v
 local JSONL session log
         |
-        +-- active /goal --> Desktop "Resume Goal" button
-        |                    (Goal continuation semantics, no user message)
-        |
-        +-- ordinary ------> Desktop failed-turn "Retry" button
-                             (same Desktop conversation and failed turn)
+        +-- any transient failure --> codex queue --thread <id> \
+                                      --message continue
+                                      (same thread, no Desktop UI switching)
 ```
 
-If the Desktop button is unavailable, the event stays pending and is retried
-after a short UI-readiness delay. The normal Desktop service never queues a
-`continue` message: that would be a new user turn rather than the official
-failed-turn/Goal action. When it temporarily opens a background thread to find
-the button, it restores the thread that was selected before recovery so the
-user's view is not stolen. The legacy queue behavior is available only through
-the explicit `--no-desktop-ui` option.
+The service does not open Electron inspector, click Desktop buttons, or switch
+the selected conversation. A queue failure is retried after a short delay. The
+live Desktop-button mode remains available when running the script manually
+without `--no-desktop-ui`, but it is not used by the installed service.
 
 Recognized conditions include:
 
@@ -158,7 +152,7 @@ See [Effect and limitations](docs/effect-and-limitations.md) and
 --desktop-unavailable-retry-ms N Delay while Desktop is closed; default: 30000 ms
 --desktop-ui-retry-ms N       Delay while the thread/button is not rendered; default: 5000 ms
 --inspector-port N        Local Desktop Node inspector port; default: 9229
---no-desktop-ui           Explicitly use the legacy queue fallback (not recommended)
+--no-desktop-ui           Use same-thread queue recovery without Desktop UI
 --scan-existing           Process historical errors; dangerous on old logs
 --all-clients             Include sessions not created by Codex Desktop
 --dry-run                 Detect and log without queueing a continuation

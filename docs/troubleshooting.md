@@ -30,7 +30,7 @@ future failures will be observed.
 Avoid `--scan-existing` on the normal session root because it can revive many
 old failed chats.
 
-## Legacy `codex queue` fallback
+## Queue-only recovery
 
 Confirm that Desktop is open and that the selected executable supports the
 command:
@@ -39,9 +39,9 @@ command:
 /usr/lib/chatgpt/resources/codex queue --help
 ```
 
-This path is used only when `--no-desktop-ui` is explicitly supplied. Normal
-Desktop mode keeps the event pending and retries the official Desktop button
-instead of sending a new message; it never switches models.
+The installed service uses this path intentionally. It sends `continue` to the
+same thread and never opens Desktop UI, so it cannot switch the conversation
+you are viewing. A visible `continue` message is expected.
 
 ## No log entry after `reconnecting 1/5`
 

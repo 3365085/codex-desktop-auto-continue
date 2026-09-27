@@ -5,27 +5,17 @@
 Codex session rollouts contain a stable thread identifier in their metadata.
 When a turn ends with a recognized transient error, this project calls:
 
-For a thread with an active `/goal`:
+The installed service uses queue-only recovery for every transient failure:
 
 ```text
-Desktop window -> Goal bar "Resume Goal"
+codex queue --thread <thread-id> --message continue
 ```
 
-This invokes Codex's own live Goal runtime continuation path. It includes the
-`blocked`/stalled state produced by a transient turn error and has the same
-meaning as the Goal bar's Continue action without inserting a visible user
-message. The existing objective, budget, and thread context are preserved.
-
-For an ordinary thread:
-
-```text
-Desktop window -> failed-turn "Retry"
-```
-
-The watcher never sends a new message in normal Desktop mode. If it temporarily
-selects a background thread to find the control, it restores the thread that
-was selected before recovery. The legacy queue behavior is available only with
-the explicit `--no-desktop-ui` option.
+The message belongs to the existing conversation and the watcher never opens
+the Electron inspector or selects another Desktop thread. This avoids changing
+the user's current view, at the cost of adding a visible `continue` message.
+The live Desktop-button behavior remains available for manual runs without
+`--no-desktop-ui`.
 
 ## Preserved state
 
@@ -42,8 +32,8 @@ non-idempotent operation.
 
 ## What the watcher does not change
 
-- It does not modify Codex Desktop or the app-server installation. It uses the
-  local Electron inspector only to click the same live controls as a user.
+- It does not modify Codex Desktop or the app-server installation, and the
+  installed service does not use the Electron inspector.
 - It does not change model selection or enable fallback routing.
 - It does not remove Codex's internal reconnect backoff or `1/5` limit.
 - It does not launch or close the Desktop application.
