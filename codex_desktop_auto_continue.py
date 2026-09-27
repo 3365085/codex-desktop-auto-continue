@@ -951,6 +951,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(
         f"[codex-auto-continue] watching {root}; max_attempts={args.max_attempts}; "
         f"message={args.message!r}; desktop_ui={not args.no_desktop_ui}; "
+        f"goal_desktop_ui={args.goal_desktop_ui}; "
         f"dry_run={args.dry_run}",
         file=sys.stderr,
         flush=True,
