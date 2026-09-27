@@ -899,6 +899,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Explicitly disable live Desktop buttons and use the legacy queue fallback.",
     )
     parser.add_argument(
+        "--goal-desktop-ui",
+        action="store_true",
+        help="Use the live Desktop Goal button, but queue ordinary failures instead of using UI.",
+    )
+    parser.add_argument(
         "--scan-existing",
         action="store_true",
         help="Process historical failures at startup; use with care.",
@@ -1036,7 +1041,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     del pending[event_key]
                     continue
 
-                if not args.no_desktop_ui and action.goal_active is not False:
+                use_desktop_ui = (
+                    not args.no_desktop_ui
+                    and action.goal_active is not False
+                    and (not args.goal_desktop_ui or action.goal_active is True)
+                )
+                if use_desktop_ui:
                     ok, detail = desktop_resume(
                         args.codex_bin,
                         action.thread_id,

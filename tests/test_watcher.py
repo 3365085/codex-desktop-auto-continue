@@ -423,9 +423,103 @@ class SessionTests(unittest.TestCase):
     def test_desktop_options_default_to_live_ui(self):
         args = MODULE.parse_args([])
         self.assertFalse(args.no_desktop_ui)
+        self.assertFalse(args.goal_desktop_ui)
         self.assertEqual(args.inspector_port, 9229)
         self.assertEqual(args.desktop_unavailable_retry_ms, 30000)
         self.assertEqual(args.desktop_ui_retry_ms, 5000)
+
+    def test_goal_desktop_mode_queues_ordinary_failure_without_ui(self):
+        self.write_records(
+            [
+                {
+                    "ordinal": 0,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": self.thread_id,
+                        "session_id": self.thread_id,
+                        "originator": "Codex Desktop",
+                    },
+                },
+                {
+                    "ordinal": 1,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "error": {"codex_error_info": "server_overloaded"},
+                    },
+                },
+            ]
+        )
+        output = io.StringIO()
+        lock_file = self.root / "watcher.lock"
+        with redirect_stderr(output), patch.object(
+            MODULE, "desktop_resume", side_effect=AssertionError("ordinary failure must not use UI")
+        ) as resume, patch.object(MODULE, "queue_continue", return_value=(True, "")) as queue:
+            status = MODULE.main(
+                [
+                    "--session-root",
+                    str(self.root),
+                    "--scan-existing",
+                    "--once",
+                    "--goal-desktop-ui",
+                    "--lock-file",
+                    str(lock_file),
+                ]
+            )
+        self.assertEqual(status, 0)
+        resume.assert_not_called()
+        queue.assert_called_once()
+        self.assertEqual(queue.call_args.args[1:], (self.thread_id, "continue"))
+
+    def test_goal_desktop_mode_uses_ui_for_active_goal(self):
+        self.write_records(
+            [
+                {
+                    "ordinal": 0,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": self.thread_id,
+                        "session_id": self.thread_id,
+                        "originator": "Codex Desktop",
+                    },
+                },
+                {
+                    "ordinal": 1,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_goal_updated",
+                        "goal": {"threadId": self.thread_id, "status": "active"},
+                    },
+                },
+                {
+                    "ordinal": 2,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "error": {"codex_error_info": "server_overloaded"},
+                    },
+                },
+            ]
+        )
+        output = io.StringIO()
+        lock_file = self.root / "watcher.lock"
+        with redirect_stderr(output), patch.object(
+            MODULE, "desktop_resume", return_value=(True, "resume-goal")
+        ) as resume, patch.object(MODULE, "queue_continue") as queue:
+            status = MODULE.main(
+                [
+                    "--session-root",
+                    str(self.root),
+                    "--scan-existing",
+                    "--once",
+                    "--goal-desktop-ui",
+                    "--lock-file",
+                    str(lock_file),
+                ]
+            )
+        self.assertEqual(status, 0)
+        resume.assert_called_once()
+        queue.assert_not_called()
 
     def test_missing_desktop_is_a_paused_condition(self):
         self.assertTrue(MODULE.desktop_unavailable("Desktop unavailable: Codex Desktop main process was not found"))

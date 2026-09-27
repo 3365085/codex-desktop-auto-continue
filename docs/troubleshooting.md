@@ -39,9 +39,11 @@ command:
 /usr/lib/chatgpt/resources/codex queue --help
 ```
 
-The installed service uses this path intentionally. It sends `continue` to the
-same thread and never opens Desktop UI, so it cannot switch the conversation
-you are viewing. A visible `continue` message is expected.
+The installed service uses this path for ordinary failures intentionally. It
+sends `continue` to the same thread and does not open Desktop UI for that
+conversation, so it cannot switch the ordinary conversation you are viewing.
+A visible `continue` message is expected. Active Goals use the separate Desktop
+Goal-button path.
 
 ## No log entry after `reconnecting 1/5`
 

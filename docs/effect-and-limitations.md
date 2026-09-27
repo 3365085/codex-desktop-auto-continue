@@ -5,17 +5,25 @@
 Codex session rollouts contain a stable thread identifier in their metadata.
 When a turn ends with a recognized transient error, this project calls:
 
-The installed service uses queue-only recovery for every transient failure:
+The installed service uses a hybrid recovery policy:
+
+For an active or blocked `/goal`:
+
+```text
+Desktop window -> Goal bar "Resume Goal"
+```
+
+For an ordinary failed turn:
 
 ```text
 codex queue --thread <thread-id> --message continue
 ```
 
-The message belongs to the existing conversation and the watcher never opens
-the Electron inspector or selects another Desktop thread. This avoids changing
-the user's current view, at the cost of adding a visible `continue` message.
-The live Desktop-button behavior remains available for manual runs without
-`--no-desktop-ui`.
+The queue message belongs to the existing conversation. The service does not
+open Desktop UI for ordinary failures, so it cannot select another ordinary
+conversation. Active Goals are the intentional exception: their official Goal
+button is used to preserve Goal runtime semantics. The full live Desktop-button
+behavior remains available for manual runs without `--goal-desktop-ui`.
 
 ## Preserved state
 

@@ -3,9 +3,9 @@
 [简体中文](README.zh-CN.md)
 
 Automatically continue transiently failed **Codex Desktop** turns on the same
-thread. The installed systemd service uses a queue-only recovery path: it sends
-the same-thread `continue` message and never selects another Desktop
-conversation. This avoids stealing focus from the conversation you are using.
+thread. The installed systemd service uses a hybrid recovery path: active Goals
+use the Desktop Goal button, while ordinary failures send a same-thread
+`continue` message and never select another Desktop conversation.
 
 It does **not** resend the original prompt, create a replacement chat, or route
 the request to another model.
@@ -22,15 +22,18 @@ Codex Desktop turn
         v
 local JSONL session log
         |
-        +-- any transient failure --> codex queue --thread <id> \
+        +-- active /goal ----------> Desktop "Resume Goal" button
+        |                             (Goal context preserved)
+        |
+        +-- ordinary failure ------> codex queue --thread <id> \
                                       --message continue
-                                      (same thread, no Desktop UI switching)
+                                      (no Desktop UI switching)
 ```
 
-The service does not open Electron inspector, click Desktop buttons, or switch
-the selected conversation. A queue failure is retried after a short delay. The
-live Desktop-button mode remains available when running the script manually
-without `--no-desktop-ui`, but it is not used by the installed service.
+The service only opens the Desktop UI for an active/blocked Goal. Ordinary
+failures are queued on the same thread without selecting that conversation. A
+queue failure is retried after a short delay. The full live Desktop-button mode
+remains available when running the script manually without `--goal-desktop-ui`.
 
 Recognized conditions include:
 
@@ -152,6 +155,7 @@ See [Effect and limitations](docs/effect-and-limitations.md) and
 --desktop-unavailable-retry-ms N Delay while Desktop is closed; default: 30000 ms
 --desktop-ui-retry-ms N       Delay while the thread/button is not rendered; default: 5000 ms
 --inspector-port N        Local Desktop Node inspector port; default: 9229
+--goal-desktop-ui         Use Desktop UI only for active/blocked Goals; queue ordinary failures
 --no-desktop-ui           Use same-thread queue recovery without Desktop UI
 --scan-existing           Process historical errors; dangerous on old logs
 --all-clients             Include sessions not created by Codex Desktop

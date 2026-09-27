@@ -3,13 +3,12 @@
 [English](README.md)
 
 这个项目在 Linux 上为官方 **Codex Desktop** 提供同线程自动继续能力。当前安装的
-systemd 服务采用 queue-only 模式：当某一轮因为模型满载、响应流断开或内部重连耗尽
-而正式失败时，向原线程发送 `continue`，不打开 Electron inspector，也不点击或切换
-Desktop 会话。
+systemd 服务采用混合模式：活动/阻塞的 `/goal` 使用 Desktop 官方“恢复目标”按钮；
+普通对话失败则向原线程发送 `continue`，不打开 UI、不切换普通对话。
 
-这不是另起一个 CLI 会话，而是向同一个线程排队一条 `continue` 消息。它不会重新发送
-原始问题，不会创建替代聊天，也不会把任务路由到其他模型。代价是这条消息会出现在
-对话中，但不会打断你当前正在看的会话。
+Goal 恢复不是另起一个 CLI 会话；普通对话则向同一个线程排队一条 `continue` 消息。
+它不会重新发送原始问题，不会创建替代聊天，也不会把任务路由到其他模型。普通对话
+中会出现可见的 `continue`，但服务不会为了点击普通失败按钮而切换你的当前会话。
 
 > 这是独立的社区项目，并非 OpenAI 官方产品，也不代表 OpenAI。
 
@@ -22,13 +21,15 @@ Codex Desktop 原线程
         ▼
 本机 JSONL 会话日志
         │
-        └─ 任意暂时性失败 ──► 原线程 queue `continue`
-                               （不操作 Desktop 界面）
+        ├─ 活动 /goal ─────► Desktop 顶部“恢复目标”
+        │                    （保留 Goal runtime）
+        └─ 普通失败 ───────► 原线程 queue `continue`
+                             （不操作 Desktop 界面）
 ```
 
-安装后的服务不会点击官方按钮，也不会为了恢复后台线程而切换界面。它直接向原线程
-发送 `continue`；queue 失败时按短间隔重试。手动运行脚本且不传 `--no-desktop-ui` 时，
-仍可使用 Desktop 按钮模式，但不建议在需要保持当前视图时使用。
+安装后的服务只为活动/阻塞 Goal 点击官方“恢复目标”；普通失败直接向原线程发送
+`continue`，不会为了普通对话而切换界面。queue 失败时按短间隔重试。手动运行脚本且
+不传 `--goal-desktop-ui` 时，仍可让普通失败也使用 Desktop 按钮模式。
 
 默认识别：
 
@@ -143,7 +144,8 @@ python3 codex_desktop_auto_continue.py \
 --desktop-unavailable-retry-ms N  Desktop 关闭时的挂起间隔；默认 30000 毫秒
 --desktop-ui-retry-ms N         Desktop 线程/按钮未渲染时的等待间隔；默认 5000 毫秒
 --inspector-port N         Desktop 本地 Node inspector 端口；默认 9229
---no-desktop-ui            使用同线程 queue continue，不操作 Desktop 界面
+--goal-desktop-ui           只有活动/阻塞 Goal 使用 Desktop 按钮，普通失败走 queue
+--no-desktop-ui             所有失败都使用同线程 queue continue，不操作 Desktop 界面
 --scan-existing            处理已有错误；对旧日志有误触发风险
 --all-clients              同时处理非 Desktop 会话
 --dry-run                  只检测和记录，不发送动作

@@ -3,16 +3,17 @@
 ## 同线程继续
 
 Codex 会话日志的元数据包含稳定的线程 ID。某轮以受支持的暂时性错误结束后，
-安装后的服务直接向同一个线程发送 queue `continue`，不读取 Desktop 标题，不打开
-Electron inspector，也不切换当前选中的会话：
+安装后的服务采用混合策略：活动/阻塞 Goal 读取线程标题并点击 Desktop 官方按钮；
+普通失败不读取 Desktop 标题、不打开 Electron inspector，直接向原线程发送 queue
+`continue`，因此不会切换普通对话：
 
 ```text
 codex queue --thread <原线程ID> --message continue
 ```
 
-这条消息属于原聊天线程，不会切换 Desktop 当前会话。代价是聊天记录中会出现一条
-可见的 `continue`，但不会打断你正在查看的另一个对话。手动运行脚本且不传
-`--no-desktop-ui` 时才会启用 Desktop 官方按钮模式。
+这条消息属于原聊天线程。普通对话中会出现可见的 `continue`，但不会为了恢复它而
+切换 Desktop 当前会话；活动 Goal 是唯一会使用 Desktop 官方按钮的例外。手动运行脚本
+且不传 `--goal-desktop-ui` 时，普通失败也可使用 Desktop 按钮模式。
 
 ## 为什么不直接调用 app-server Goal API
 
@@ -35,7 +36,7 @@ app-server 连接；因此不会创建 Desktop 的新 turn。包装器仍然使�
 
 ## 不会改变什么
 
-- 不修改 Codex Desktop 或 app-server 的安装文件，也不会由安装后的服务操作 Desktop UI；
+- 不修改 Codex Desktop 或 app-server 的安装文件；安装后的服务只为活动 Goal 操作 Desktop UI；
 - 不改变模型选择，也不启用模型 fallback；
 - 不删除 Desktop 内部 `1/5` 重连等待；包装器只在正式的 `task_complete.error`
   之后立即点击官方按钮；
@@ -49,8 +50,8 @@ app-server 内部实现，而不是这个外部包装器。
 
 ## 本地 inspector 安全边界
 
-手动启用 Desktop 按钮模式时，监视器才会向当前 Electron 主进程发送 `SIGUSR1`。
-安装后的 queue-only 服务不需要 Node inspector。
+活动 Goal 或手动启用 Desktop 按钮模式时，监视器才会向当前 Electron 主进程发送
+`SIGUSR1`。普通失败的 queue 路径不需要 Node inspector。
 
 ## 并发注意事项
 

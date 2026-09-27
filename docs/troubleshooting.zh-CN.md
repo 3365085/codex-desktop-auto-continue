@@ -58,8 +58,9 @@ systemctl --user restart codex-desktop-auto-continue.service
 /usr/lib/chatgpt/resources/codex queue --help
 ```
 
-安装后的服务本来就使用这个 queue-only 路径：它向同一个线程发送 `continue`，不打开
-Desktop UI，因此不会切换你正在看的会话。聊天中出现可见的 `continue` 消息是预期行为。
+安装后的服务对普通失败使用这个 queue 路径：它向同一个线程发送 `continue`，不打开
+普通对话的 Desktop UI，因此不会切换你正在看的普通会话。聊天中出现可见的
+`continue` 消息是预期行为；活动 Goal 仍使用 Desktop 官方“恢复目标”按钮。
 
 ## `正在重新连接 1/5` 后没有日志
 
