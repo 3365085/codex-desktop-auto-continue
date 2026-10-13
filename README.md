@@ -2,8 +2,9 @@
 
 [简体中文](README.zh-CN.md)
 
-Automatically continue transiently failed **Codex Desktop** turns on the same
-thread. The installed systemd service uses a hybrid recovery path: active Goals
+Automatically continue transiently failed **Codex Desktop** and interactive
+**Codex CLI** (`codex` in a terminal) turns on the same thread, on Linux and
+Windows. The installed systemd service uses a hybrid recovery path: active Goals
 use the Desktop Goal button, while ordinary failures send a same-thread
 `continue` message and never select another Desktop conversation.
 
@@ -62,9 +63,15 @@ If a transient turn failure leaves the Goal `blocked` (shown as stalled in
 Desktop), the watcher clicks the Goal bar's Resume button just like a user.
 Manually paused, completed, or usage-limited Goals are not resumed automatically.
 
+To stay out of your way, the watcher never switches threads while you are
+using Desktop: if the Goal thread is not the selected one and the Desktop
+window is focused with keyboard/mouse input in the last 15 seconds, the click
+is deferred (retried every 5 s) until you are idle or in another app. It then
+selects the Goal thread, clicks Resume, and switches straight back.
+
 ## Requirements
 
-- Linux with a systemd user session
+- Linux with a systemd user session, or Windows 10/11 (see [Windows](#windows))
 - Python 3.10 or newer
 - Codex Desktop / ChatGPT Desktop, running as the same Linux user, with a
   graphical X11 session
@@ -155,14 +162,78 @@ See [Effect and limitations](docs/effect-and-limitations.md) and
 --desktop-unavailable-retry-ms N Delay while Desktop is closed; default: 30000 ms
 --desktop-ui-retry-ms N       Delay while the thread/button is not rendered; default: 5000 ms
 --inspector-port N        Local Desktop Node inspector port; default: 9229
+--goal-switch-idle-ms N   Focused Desktop: input idle time required before switching to a Goal thread; default: 15000 ms
+--desktop-exe NAME        Windows only: Desktop main executable, repeatable; default: Codex.exe, ChatGPT.exe
+--log-file PATH           Append logs to a file instead of stderr (for pythonw.exe)
 --goal-desktop-ui         Use Desktop UI only for active/blocked Goals; queue ordinary failures
 --no-desktop-ui           Use same-thread queue recovery without Desktop UI
 --scan-existing           Process historical errors; dangerous on old logs
---all-clients             Include sessions not created by Codex Desktop
+--desktop-only            Handle Codex Desktop only; ignore terminal `codex` sessions
+--all-clients             Also include non-interactive `codex exec` sessions
 --dry-run                 Detect and log without queueing a continuation
 --once                    Run one scan and exit
 --version                 Print the version
 ```
+
+## Terminal `codex` (CLI)
+
+Interactive `codex` sessions run on the shared local app-server daemon by
+default (Linux and Windows). The watcher talks to it through
+`codex app-server proxy`:
+
+- **Interrupted `/goal`**: the Goal turns `blocked` and the CLI does not resume
+  it on its own. The watcher sets it back to `active` on the daemon, the same
+  as `/goal resume`: the Goal runtime continues immediately, with no chat
+  message and no UI involved.
+- **Ordinary failures**: `continue` is queued on the same session
+  (`codex queue`), and the daemon starts the next turn right away.
+- Only sessions currently open on the daemon are touched; closed sessions are
+  never resumed behind your back.
+- Sessions started with `--no-daemon`, command-line config overrides (`-c`,
+  `--enable`, ...), `--profile`, `--oss`, from an elevated Windows terminal, or
+  with a WSL `CODEX_HOME` on a Windows drive run without the daemon and cannot
+  be reached.
+- Paused, usage/budget-limited and completed Goals are left alone.
+
+If a Desktop thread happens to be hosted by the daemon too, its Goal is
+resumed there without touching the UI; otherwise the Desktop button is used.
+
+Errors are now classified more carefully: 401/403 and other client errors are
+no longer retried, and stream failures logged in object form
+(`{"response_stream_disconnected": {...}}`) are recognized.
+
+## Windows
+
+The same watcher runs on Windows; only the platform layer differs:
+
+| Linux | Windows |
+| --- | --- |
+| systemd user service | Per-user logon scheduled task (falls back to an HKCU Run entry), windowless `pythonw.exe` |
+| `/proc` scan for the Electron main process | `Get-CimInstance Win32_Process` for `Codex.exe` / `ChatGPT.exe`, skipping `--type=` children and `resources\codex.exe` |
+| `kill -USR1` to open the Node inspector | The mechanism behind Node's `process._debugProcess()` (`node-debug-handler-<pid>` + `CreateRemoteThread`) |
+| `fcntl` lock | `msvcrt` lock under `%LOCALAPPDATA%\codex-desktop-auto-continue` |
+| journalctl | `%LOCALAPPDATA%\codex-desktop-auto-continue\watcher.log` |
+
+Requirements: Python 3.10+, and a Codex CLI that can be launched directly —
+`codex` on `PATH` (e.g. `npm install -g @openai/codex`), `CODEX_CLI_PATH`, or
+`-CodexBin`. The copy inside the Microsoft Store package (`WindowsApps\...`)
+is usually blocked from direct launch. Sessions are read from
+`%USERPROFILE%\.codex\sessions`; if the app runs its agent in WSL, point
+`--session-root` at the WSL path or use the Linux install inside WSL.
+
+Install by double-clicking `install.cmd`, or:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\windows\install.ps1 -CodexBin "C:\path\to\codex.exe"
+Get-Content -Wait -Tail 50 "$env:LOCALAPPDATA\codex-desktop-auto-continue\watcher.log"
+```
+
+Uninstall with `uninstall.cmd`.
+
+Known limits: Goal resume needs the Electron main process to accept the Node
+inspector (if a build disables it, the log shows `could not enable Desktop
+inspector` and only ordinary-failure queueing works); Goal buttons are matched
+by their Chinese aria-labels; Python and Codex must share an architecture.
 
 ## Uninstall
 

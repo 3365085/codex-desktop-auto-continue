@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-这个项目在 Linux 上为官方 **Codex Desktop** 提供同线程自动继续能力。当前安装的
+这个项目在 Linux 和 Windows 上为官方 **Codex Desktop** 和交互式 **Codex CLI**（终端里的 `codex`）提供同线程自动继续能力。当前安装的
 systemd 服务采用混合模式：活动/阻塞的 `/goal` 使用 Desktop 官方“恢复目标”按钮；
 普通对话失败则向原线程发送 `continue`，不打开 UI、不切换普通对话。
 
@@ -51,13 +51,17 @@ Codex Desktop 原线程
 
 如果本轮暂时性失败让 Goal 变成 Desktop 中显示的“目标已停滞”，监视器会点击顶部“恢复目标”。手动暂停、完成或受用量限制的 Goal 不会被擅自恢复；只有会话日志中已经是 active/blocked 的目标才会自动处理。
 
+为了不干扰前台对话：如果 Goal 所在线程不是当前选中的线程，而 Desktop 窗口正处于前台且
+最近 15 秒内有键盘/鼠标操作，监视器会暂缓点击，每 5 秒重试，直到你空闲或切到别的程序后
+才切过去点“恢复目标”并立即切回原线程。普通对话失败始终走 queue，不碰界面。
+
 ## 普通线程为什么点击“重试”
 
 重复原始问题会把未完成的工作重新解释成一个新任务，可能重复执行命令、重复修改文件或覆盖已有判断。Desktop 错误卡片的“重试”是官方针对失败轮次的动作，监视器点击它而不是重发原始问题，所以不会把已经落盘的修改变成一次新的用户请求。
 
 ## 系统要求
 
-- Linux，具备 systemd 用户会话和 X11/桌面会话；
+- Linux，具备 systemd 用户会话和 X11/桌面会话；或 Windows 10/11（见下方“Windows”）；
 - Python 3.10 或更高版本；
 - Codex Desktop / ChatGPT Desktop，且与监视器使用同一个 Linux 用户；
 - Desktop 捆绑的 `codex` 可执行文件（安装器会自动寻找 `/usr/lib/chatgpt/resources/codex`，也支持 `PATH` 中的 `codex`）。
@@ -144,14 +148,88 @@ python3 codex_desktop_auto_continue.py \
 --desktop-unavailable-retry-ms N  Desktop 关闭时的挂起间隔；默认 30000 毫秒
 --desktop-ui-retry-ms N         Desktop 线程/按钮未渲染时的等待间隔；默认 5000 毫秒
 --inspector-port N         Desktop 本地 Node inspector 端口；默认 9229
+--goal-switch-idle-ms N     Desktop 窗口在前台时，键鼠空闲多久才允许切到 Goal 线程；默认 15000 毫秒
+--desktop-exe NAME         仅 Windows：Desktop 主进程文件名，可重复；默认 Codex.exe、ChatGPT.exe
+--log-file PATH            日志追加写入文件而不是 stderr（pythonw.exe 下使用）
 --goal-desktop-ui           只有活动/阻塞 Goal 使用 Desktop 按钮，普通失败走 queue
 --no-desktop-ui             所有失败都使用同线程 queue continue，不操作 Desktop 界面
 --scan-existing            处理已有错误；对旧日志有误触发风险
---all-clients              同时处理非 Desktop 会话
+--desktop-only             只处理 Desktop，忽略终端 `codex` 会话
+--all-clients              连非交互的 `codex exec` 会话也处理
 --dry-run                  只检测和记录，不发送动作
 --once                     扫描一次后退出
 --version                  显示版本
 ```
+
+## 终端 `codex`（CLI）
+
+终端里的 `codex` 默认运行在共享的本地 app-server 守护进程上（Linux、Windows 均如此）。
+监视器通过 `codex app-server proxy` 连到这个守护进程：
+
+- **CLI 的 `/goal` 中断后**：Goal 会变成 `blocked`，CLI 自己不会再继续，只能手动
+  `/goal resume`。监视器会在守护进程上把它重新设为 `active`，效果等同 `/goal resume`：
+  Goal runtime 立即开始续跑，聊天中不插入任何消息，不需要切换任何界面。
+- **普通对话失败**：向原会话排队一条 `continue`（`codex queue`），守护进程会马上开始新一轮。
+- 只处理守护进程上**正在打开**的会话；已关闭的会话不会被偷偷续跑。
+- 以下情况 CLI 不走守护进程，监视器无法接管：`--no-daemon`、`-c`/`--enable` 等命令行配置
+  覆盖、`--profile`、`--oss`、Windows 管理员终端、WSL 中 CODEX_HOME 位于 Windows 挂载盘。
+- 手动暂停、额度用尽、预算用尽或已完成的 Goal 不会被恢复。
+
+如果 Desktop 的线程也恰好由这个守护进程承载，Desktop 的 Goal 同样会直接在守护进程上恢复，
+完全不碰界面；否则才退回点击“恢复目标”按钮。
+
+此外，401/403 等认证或请求错误不再被当作可重试错误，避免无意义的反复继续；
+断流类错误（`response_stream_disconnected` 等）在会话日志中以对象形式记录，现在也能识别。
+
+## Windows
+
+Windows 版使用同一个 `codex_desktop_auto_continue.py`，差异只在平台层：
+
+| Linux | Windows |
+| --- | --- |
+| systemd 用户服务 | 当前用户登录时运行的计划任务（失败时回退到 HKCU Run 启动项），`pythonw.exe` 无窗口运行 |
+| 扫描 `/proc` 找 Electron 主进程 | `Get-CimInstance Win32_Process` 查找 `Codex.exe` / `ChatGPT.exe` 主进程（排除 `--type=` 子进程和 `resources\codex.exe`） |
+| `kill -USR1` 打开 Node inspector | 与 Node `process._debugProcess()` 相同的机制（`node-debug-handler-<pid>` + `CreateRemoteThread`） |
+| `fcntl` 文件锁 | `msvcrt` 文件锁，位于 `%LOCALAPPDATA%\codex-desktop-auto-continue` |
+| journalctl | `%LOCALAPPDATA%\codex-desktop-auto-continue\watcher.log` |
+
+要求：
+
+- Python 3.10+（python.org 安装版或 `py` 启动器）；
+- 可直接运行的 Codex CLI：`PATH` 中的 `codex`（如 `npm install -g @openai/codex`），或
+  `CODEX_CLI_PATH`，或安装时 `-CodexBin` 指定。Microsoft Store 包内
+  `WindowsApps\...\resources\codex.exe` 通常被包权限阻止直接启动，不建议使用；
+- 会话日志默认在 `%USERPROFILE%\.codex\sessions`。如果 Codex 应用设置为在 WSL 中运行
+  agent，会话写在 WSL 里，需要改用 Linux 版或用 `--session-root` 指向
+  `\\wsl$\<发行版>\home\<用户>\.codex\sessions`。
+
+安装（双击或在仓库目录执行）：
+
+```bat
+install.cmd
+```
+
+或在 PowerShell 中指定参数：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\windows\install.ps1 -CodexBin "C:\path\to\codex.exe"
+```
+
+查看日志：
+
+```powershell
+Get-Content -Wait -Tail 50 "$env:LOCALAPPDATA\codex-desktop-auto-continue\watcher.log"
+```
+
+卸载：双击 `uninstall.cmd`。
+
+Windows 下的已知限制：
+
+- Goal 恢复依赖 Electron 主进程允许打开 Node inspector。若 Codex 的 Windows 构建关闭了
+  该能力（Electron fuse），日志会出现 `could not enable Desktop inspector`；此时普通对话的
+  queue 继续仍可用，Goal 会保持等待。
+- Goal 按钮按 aria-label `恢复目标` / `暂停目标` 识别，即需要 Desktop 使用中文界面。
+- Python 与 Codex 必须同为 64 位（或同为 ARM64），否则无法创建远程线程。
 
 ## 卸载
 

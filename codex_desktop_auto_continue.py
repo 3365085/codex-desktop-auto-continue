@@ -5,17 +5,17 @@ from __future__ import annotations
 
 import argparse
 import base64
-import fcntl
 import json
 import os
+import queue
 import re
-import select
 import signal
 import shutil
 import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -24,9 +24,25 @@ from pathlib import Path
 from typing import Iterator, Sequence, TextIO
 
 
-VERSION = "0.3.4"
+IS_WINDOWS = os.name == "nt"
+
+if IS_WINDOWS:
+    import msvcrt
+else:
+    import fcntl
+
+
+VERSION = "0.4.0"
 DEFAULT_DESKTOP_UNAVAILABLE_RETRY_MS = 30_000
 DEFAULT_DESKTOP_UI_RETRY_MS = 5_000
+DEFAULT_GOAL_SWITCH_IDLE_MS = 15_000
+# Daemon probes for a CLI event before it is dropped (about 10 minutes at the
+# default --desktop-unavailable-retry-ms).
+CLI_UNAVAILABLE_ATTEMPTS = 20
+
+DESKTOP_ORIGINATOR = "Codex Desktop"
+# One-shot `codex exec` runs leave no interactive session to continue.
+NON_INTERACTIVE_ORIGINATORS = frozenset({"codex_exec"})
 
 TRANSIENT_CODES = frozenset(
     {
@@ -47,6 +63,14 @@ TRANSIENT_TEXT = (
     "response stream connection failed",
     "response stream disconnected",
 )
+
+# Executable names of the Electron main process on Windows. The Microsoft Store
+# Codex app ships `Codex.exe`; `ChatGPT.exe` covers the ChatGPT-branded build.
+DEFAULT_WINDOWS_DESKTOP_EXECUTABLES = ("Codex.exe", "ChatGPT.exe")
+
+# Console programs such as codex.exe and powershell.exe would otherwise flash a
+# window for every call when the watcher runs under pythonw.exe.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 THREAD_ID_RE = re.compile(
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$",
@@ -71,14 +95,46 @@ class PendingContinuation:
     thread_id: str
     reason: str
     goal_active: bool | None = None
+    client: str = "desktop"
     attempts: int = 0
     next_attempt_at: float = 0.0
     desktop_unavailable_logged: bool = False
     desktop_ui_wait_logged: bool = False
 
 
+class AppServerError(RuntimeError):
+    """An app-server connection or JSON-RPC request failed."""
+
+
 class WebSocketError(RuntimeError):
     """The local Node inspector could not be used."""
+
+
+def websocket_frame(opcode: int, data: bytes) -> bytes:
+    """Build one masked client frame."""
+
+    mask = os.urandom(4)
+    masked = bytes(value ^ mask[index % 4] for index, value in enumerate(data))
+    length = len(data)
+    if length < 126:
+        header = bytes((0x80 | opcode, 0x80 | length))
+    elif length < 65536:
+        header = bytes((0x80 | opcode, 0x80 | 126)) + struct.pack("!H", length)
+    else:
+        header = bytes((0x80 | opcode, 0x80 | 127)) + struct.pack("!Q", length)
+    return header + mask + masked
+
+
+def websocket_handshake(host: str, path: str) -> bytes:
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    return (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    ).encode("ascii")
 
 
 class InspectorWebSocket:
@@ -94,16 +150,7 @@ class InspectorWebSocket:
         self.timeout = timeout
         self.sock = socket.create_connection((self.host, self.port), timeout=timeout)
         self.sock.settimeout(timeout)
-        key = base64.b64encode(os.urandom(16)).decode("ascii")
-        request = (
-            f"GET {self.path} HTTP/1.1\r\n"
-            f"Host: {self.host}:{self.port}\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n"
-        ).encode("ascii")
-        self.sock.sendall(request)
+        self.sock.sendall(websocket_handshake(f"{self.host}:{self.port}", self.path))
         header = self._read_until(b"\r\n\r\n")
         if not header.startswith(b"HTTP/1.1 101"):
             self.close()
@@ -120,16 +167,7 @@ class InspectorWebSocket:
 
     def send_json(self, payload: dict[str, object]) -> None:
         data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        mask = os.urandom(4)
-        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(data))
-        length = len(data)
-        if length < 126:
-            header = bytes((0x81, 0x80 | length))
-        elif length < 65536:
-            header = bytes((0x81, 0x80 | 126)) + struct.pack("!H", length)
-        else:
-            header = bytes((0x81, 0x80 | 127)) + struct.pack("!Q", length)
-        self.sock.sendall(header + mask + masked)
+        self.sock.sendall(websocket_frame(0x1, data))
 
     def recv_json(self) -> dict[str, object]:
         first = self._recv_exact(2)
@@ -168,9 +206,7 @@ class InspectorWebSocket:
         return bytes(data)
 
     def _send_control(self, opcode: int, data: bytes) -> None:
-        mask = os.urandom(4)
-        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(data))
-        self.sock.sendall(bytes((0x80 | opcode, 0x80 | len(data))) + mask + masked)
+        self.sock.sendall(websocket_frame(opcode, data))
 
     def close(self) -> None:
         try:
@@ -185,9 +221,22 @@ def default_codex_home() -> Path:
 
 
 def default_lock_file() -> Path:
+    if IS_WINDOWS:
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+        return base / "codex-desktop-auto-continue" / "watcher.lock"
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
     base = Path(runtime_dir) if runtime_dir else Path("/tmp") / f"codex-auto-continue-{os.getuid()}"
     return base / "watcher.lock"
+
+
+def default_codex_bin() -> str:
+    if IS_WINDOWS:
+        configured = os.environ.get("CODEX_CLI_PATH")
+        if configured:
+            return configured
+        return shutil.which("codex") or "codex"
+    return shutil.which("codex") or "/usr/lib/chatgpt/resources/codex"
 
 
 def inspector_target(port: int, timeout_ms: int) -> str | None:
@@ -220,8 +269,182 @@ def is_chatgpt_main_command(executable: str, raw_cmdline: bytes) -> bool:
     return not re.search(r"(?:^|\s)--type=", command_line)
 
 
-def chatgpt_main_pid() -> int | None:
+def select_windows_desktop_main_pid(
+    processes: Sequence[dict[str, object]],
+    executables: Sequence[str],
+) -> int | None:
+    """Pick the Electron main process from Win32_Process rows.
+
+    The Codex CLI bundled under ``app\\resources`` is also named ``codex.exe``
+    and Windows names are case-insensitive, so exclude anything under a
+    ``resources`` directory and prefer the process that owns ``--type=``
+    Chromium children.
+    """
+
+    names = {name.casefold() for name in executables}
+    child_type = re.compile(r"(?:^|\s)--type=")
+    rows: list[tuple[int, int | None, str, str, str]] = []
+    for row in processes:
+        try:
+            pid = int(row.get("ProcessId"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        try:
+            parent: int | None = int(row.get("ParentProcessId"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            parent = None
+        rows.append(
+            (
+                pid,
+                parent,
+                str(row.get("Name") or "").casefold(),
+                str(row.get("ExecutablePath") or "").casefold().replace("/", "\\"),
+                str(row.get("CommandLine") or ""),
+            )
+        )
+
+    candidates = [
+        pid
+        for pid, _, name, executable, command_line in rows
+        if name in names
+        and not child_type.search(command_line)
+        and "\\resources\\" not in executable
+    ]
+    for pid in candidates:
+        if any(
+            parent == pid and child_type.search(command_line)
+            for _, parent, _, _, command_line in rows
+        ):
+            return pid
+    return candidates[0] if candidates else None
+
+
+def windows_desktop_processes(executables: Sequence[str]) -> list[dict[str, object]]:
+    """List candidate Desktop processes with their command lines."""
+
+    names = {name for name in executables if re.fullmatch(r"[\w.\- ]+", name)}
+    if not names:
+        return []
+    # Children are needed too, to tell the main process from the bundled CLI.
+    script = (
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+        "$rows=@(Get-CimInstance Win32_Process -Filter \""
+        + " OR ".join(f"Name='{name}'" for name in sorted(names))
+        + "\" | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine);"
+        "ConvertTo-Json -InputObject $rows -Compress -Depth 2"
+    )
+    # -EncodedCommand sidesteps cmd-line quoting rules for the embedded quotes.
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+            creationflags=NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    text = completed.stdout.decode("utf-8", errors="replace").strip()
+    if not text:
+        return []
+    try:
+        rows = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(rows, dict):
+        rows = [rows]
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def windows_enable_inspector(pid: int) -> None:
+    """Windows equivalent of ``kill -USR1``: Node's ``process._debugProcess``.
+
+    Node exposes a per-process file mapping holding the address of its debug
+    handler; running that handler on a remote thread opens the inspector on
+    127.0.0.1:9229, exactly as SIGUSR1 does on Linux.
+    """
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenFileMappingW.restype = wintypes.HANDLE
+    kernel32.OpenFileMappingW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.MapViewOfFile.restype = ctypes.c_void_p
+    kernel32.MapViewOfFile.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_size_t,
+    ]
+    kernel32.UnmapViewOfFile.argtypes = [ctypes.c_void_p]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.CreateRemoteThread.restype = wintypes.HANDLE
+    kernel32.CreateRemoteThread.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    ]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    file_map_read = 0x0004
+    access = 0x0002 | 0x0400 | 0x0008 | 0x0020 | 0x0010  # create thread, query, VM op/write/read
+
+    def failure(step: str) -> OSError:
+        code = ctypes.get_last_error()
+        return OSError(code, f"{step} failed: {ctypes.FormatError(code).strip()}")
+
+    mapping = kernel32.OpenFileMappingW(file_map_read, False, f"node-debug-handler-{pid}")
+    if not mapping:
+        raise failure("opening the Node debug handler (inspector may be disabled)")
+    try:
+        view = kernel32.MapViewOfFile(mapping, file_map_read, 0, 0, ctypes.sizeof(ctypes.c_void_p))
+        if not view:
+            raise failure("MapViewOfFile")
+        try:
+            handler = ctypes.c_void_p.from_address(view).value
+        finally:
+            kernel32.UnmapViewOfFile(view)
+    finally:
+        kernel32.CloseHandle(mapping)
+    if not handler:
+        raise OSError("Node debug handler address is empty")
+
+    process = kernel32.OpenProcess(access, False, pid)
+    if not process:
+        raise failure("OpenProcess")
+    try:
+        thread = kernel32.CreateRemoteThread(process, None, 0, handler, None, 0, None)
+        if not thread:
+            raise failure("CreateRemoteThread")
+        try:
+            kernel32.WaitForSingleObject(thread, 5000)
+        finally:
+            kernel32.CloseHandle(thread)
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def chatgpt_main_pid(
+    windows_executables: Sequence[str] = DEFAULT_WINDOWS_DESKTOP_EXECUTABLES,
+) -> int | None:
     """Find the Electron main process without matching renderer children."""
+
+    if IS_WINDOWS:
+        return select_windows_desktop_main_pid(
+            windows_desktop_processes(windows_executables), windows_executables
+        )
 
     for entry in Path("/proc").glob("[0-9]*"):
         try:
@@ -242,17 +465,24 @@ def chatgpt_main_pid() -> int | None:
     return None
 
 
-def ensure_node_inspector(port: int, timeout_ms: int) -> tuple[str | None, bool, str]:
+def ensure_node_inspector(
+    port: int,
+    timeout_ms: int,
+    windows_executables: Sequence[str] = DEFAULT_WINDOWS_DESKTOP_EXECUTABLES,
+) -> tuple[str | None, bool, str]:
     """Open the loopback-only Electron inspector on demand when needed."""
 
     existing = inspector_target(port, timeout_ms)
     if existing:
         return existing, False, ""
-    pid = chatgpt_main_pid()
+    pid = chatgpt_main_pid(windows_executables)
     if pid is None:
         return None, False, "Codex Desktop main process was not found"
     try:
-        os.kill(pid, signal.SIGUSR1)
+        if IS_WINDOWS:
+            windows_enable_inspector(pid)
+        else:
+            os.kill(pid, signal.SIGUSR1)
     except OSError as exc:
         return None, False, f"could not enable Desktop inspector: {exc}"
     deadline = time.monotonic() + timeout_ms / 1000.0
@@ -268,11 +498,35 @@ def clean_text(value: object) -> str:
     return str(value).casefold()
 
 
+def error_code(info: object) -> tuple[str | None, int | None]:
+    """Split ``codex_error_info`` into its name and HTTP status.
+
+    Unit variants are logged as a string (``"server_overloaded"``); variants
+    with data as a one-key object
+    (``{"response_stream_disconnected": {"http_status_code": 502}}``).
+    """
+
+    if isinstance(info, str):
+        return info, None
+    if isinstance(info, dict) and len(info) == 1:
+        name, details = next(iter(info.items()))
+        status = None
+        if isinstance(details, dict):
+            value = details.get("http_status_code", details.get("httpStatusCode"))
+            status = value if isinstance(value, int) else None
+        return str(name), status
+    return None, None
+
+
 def transient_reason(error: object) -> str | None:
     if isinstance(error, dict):
-        code = error.get("codex_error_info") or error.get("codexErrorInfo")
-        if code and str(code).casefold() in TRANSIENT_CODES:
-            return str(code)
+        code, status = error_code(error.get("codex_error_info") or error.get("codexErrorInfo"))
+        if code and re.sub(r"(?<!^)(?=[A-Z])", "_", code).casefold() in TRANSIENT_CODES:
+            # Authentication, permission and request errors fail the same way
+            # on every retry; only timeouts and rate limits are worth repeating.
+            if status is not None and 400 <= status < 500 and status not in {408, 429}:
+                return None
+            return code
         message = error.get("message", "")
         details = error.get("additional_details") or error.get("additionalDetails") or ""
         text = f"{message} {details}"
@@ -363,6 +617,7 @@ def queue_continue(codex_bin: str, thread_id: str, message: str) -> tuple[bool, 
             encoding="utf-8",
             errors="replace",
             check=False,
+            creationflags=NO_WINDOW,
         )
     except OSError as exc:
         return False, str(exc)
@@ -371,75 +626,272 @@ def queue_continue(codex_bin: str, thread_id: str, message: str) -> tuple[bool, 
     return completed.returncode == 0, detail
 
 
+class AppServerClient:
+    """Minimal JSON-RPC client for `codex app-server` over a child's stdio.
+
+    A plain `codex app-server` speaks newline-delimited JSON. With
+    ``websocket=True`` the child is `codex app-server proxy`, which relays raw
+    bytes to the shared daemon's control socket; that socket speaks WebSocket,
+    so messages are framed accordingly. Replies are read on a helper thread so
+    every wait honours the deadline on all platforms.
+    """
+
+    def __init__(
+        self, command: Sequence[str], timeout_ms: int, *, websocket: bool = False
+    ) -> None:
+        self.command = list(command)
+        self.websocket = websocket
+        self.deadline = time.monotonic() + timeout_ms / 1000.0
+        self.process: subprocess.Popen | None = None
+        self._messages: "queue.Queue[dict[str, object] | str]" = queue.Queue()
+        self._write_lock = threading.Lock()
+        self._handshake_done = threading.Event()
+        self._handshake_ok = False
+        self._next_id = 0
+
+    def __enter__(self) -> "AppServerClient":
+        try:
+            self.process = subprocess.Popen(
+                self.command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                creationflags=NO_WINDOW,
+            )
+        except OSError as exc:
+            raise AppServerError(str(exc)) from exc
+        try:
+            if self.websocket:
+                self._write_raw(websocket_handshake("localhost", "/"))
+            threading.Thread(target=self._pump, daemon=True).start()
+            if self.websocket:
+                # The daemon drops a frame that arrives together with the
+                # upgrade request, so wait for the 101 before talking.
+                self._handshake_done.wait(max(0.0, self.deadline - time.monotonic()))
+                if not self._handshake_ok:
+                    try:
+                        detail = self._messages.get_nowait()
+                    except queue.Empty:
+                        detail = "timed out waiting for the daemon WebSocket handshake"
+                    raise AppServerError(str(detail))
+            self.request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "codex-desktop-auto-continue",
+                        "title": "Codex Desktop Auto Continue",
+                        "version": VERSION,
+                    },
+                    "capabilities": {"experimentalApi": True},
+                },
+            )
+            self._send({"method": "initialized", "params": {}})
+        except AppServerError:
+            stop_app_server(self.process)
+            raise
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        if self.process is not None:
+            stop_app_server(self.process)
+
+    def request(self, method: str, params: dict[str, object]) -> object:
+        self._next_id += 1
+        request_id = self._next_id
+        self._send({"id": request_id, "method": method, "params": params})
+        while True:
+            message = self._next_message()
+            if message.get("id") != request_id:
+                continue  # notifications and unrelated traffic
+            error = message.get("error")
+            if error is not None:
+                detail = error.get("message") or error.get("code") if isinstance(error, dict) else error
+                raise AppServerError(f"app-server error: {detail or error}")
+            return message.get("result")
+
+    def _next_message(self) -> dict[str, object]:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise AppServerError("timed out waiting for app-server response")
+        try:
+            message = self._messages.get(timeout=remaining)
+        except queue.Empty:
+            raise AppServerError("timed out waiting for app-server response") from None
+        if isinstance(message, str):
+            self._messages.put(message)  # keep reporting the same end-of-stream
+            raise AppServerError(message)
+        return message
+
+    def _send(self, message: dict[str, object]) -> None:
+        data = json.dumps(message, ensure_ascii=False).encode("utf-8")
+        self._write_raw(websocket_frame(0x1, data) if self.websocket else data + b"\n")
+
+    def _write_raw(self, data: bytes) -> None:
+        assert self.process is not None and self.process.stdin is not None
+        try:
+            with self._write_lock:
+                self.process.stdin.write(data)
+                self.process.stdin.flush()
+        except (OSError, ValueError) as exc:
+            raise AppServerError(f"could not write to app-server: {exc}") from exc
+
+    def _pump(self) -> None:
+        assert self.process is not None and self.process.stdout is not None
+        stream = self.process.stdout
+        try:
+            if self.websocket:
+                self._pump_websocket(stream)
+            else:
+                for raw in stream:
+                    self._deliver(raw)
+            self._messages.put("app-server closed its protocol stream")
+        except (OSError, ValueError, WebSocketError, AppServerError) as exc:
+            self._messages.put(f"app-server stream failed: {exc}")
+        finally:
+            self._handshake_done.set()
+
+    def _deliver(self, raw: bytes) -> None:
+        try:
+            message = json.loads(raw.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            return
+        if isinstance(message, dict):
+            self._messages.put(message)
+
+    def _pump_websocket(self, stream: object) -> None:
+        def read_exact(size: int) -> bytes:
+            data = stream.read(size)  # type: ignore[attr-defined]
+            if len(data) != size:
+                raise WebSocketError("daemon connection closed")
+            return data
+
+        header = bytearray()
+        while not header.endswith(b"\r\n\r\n"):
+            header.extend(read_exact(1))
+        if not header.startswith(b"HTTP/1.1 101"):
+            status = header.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+            raise WebSocketError(f"daemon WebSocket handshake failed: {status}")
+        self._handshake_ok = True
+        self._handshake_done.set()
+        fragments = bytearray()
+        while True:
+            first = read_exact(2)
+            final, opcode = first[0] & 0x80, first[0] & 0x0F
+            length = first[1] & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", read_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", read_exact(8))[0]
+            mask = read_exact(4) if first[1] & 0x80 else b""
+            data = read_exact(length) if length else b""
+            if mask:
+                data = bytes(value ^ mask[index % 4] for index, value in enumerate(data))
+            if opcode == 0x8:
+                return
+            if opcode == 0x9:
+                self._write_raw(websocket_frame(0xA, data))
+                continue
+            if opcode in (0x1, 0x2, 0x0):
+                fragments.extend(data)
+                if final:
+                    self._deliver(bytes(fragments))
+                    fragments.clear()
+
+
 def thread_name(codex_bin: str, thread_id: str, timeout_ms: int) -> tuple[bool, str, str]:
     """Read the Desktop display name without creating a turn."""
 
-    command = [codex_bin, "app-server", "--listen", "stdio://"]
     try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-    except OSError as exc:
+        with AppServerClient([codex_bin, "app-server", "--listen", "stdio://"], timeout_ms) as client:
+            result = client.request(
+                "thread/read", {"threadId": thread_id, "includeTurns": False}
+            )
+    except AppServerError as exc:
         return False, "", str(exc)
+    thread = result.get("thread") if isinstance(result, dict) else None
+    name = thread.get("name") if isinstance(thread, dict) else None
+    if not isinstance(name, str) or not name.strip():
+        return False, "", "thread/read returned no Desktop thread name"
+    return True, name, ""
 
-    assert process.stdin is not None
-    assert process.stdout is not None
-    deadline = time.monotonic() + timeout_ms / 1000.0
+
+def daemon_resume(codex_bin: str, thread_id: str, *, timeout_ms: int) -> tuple[str, str]:
+    """Resume a Goal on the shared app-server daemon hosting the live thread.
+
+    Interactive `codex` sessions run their turns inside the shared local
+    app-server daemon. There, `thread/goal/set` with status ``active`` takes
+    the same path as `/goal resume`: the Goal runtime starts a continuation
+    turn as soon as the thread is idle, with no visible user message. A
+    separate stdio app-server would only persist the status without starting a
+    turn, so the request goes through `codex app-server proxy` and is sent only
+    when the daemon reports the thread as loaded.
+
+    Returns ``(outcome, detail)``; outcome is ``goal-resumed``,
+    ``goal-inactive`` (paused, usage/budget limited or complete), ``no-goal``,
+    ``not-loaded`` or ``unavailable`` (no daemon or no proxy support).
+    """
+
     try:
-        initialize = {
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "clientInfo": {
-                    "name": "codex-desktop-auto-continue",
-                    "title": "Codex Desktop Auto Continue",
-                    "version": VERSION,
-                },
-                "capabilities": {"experimentalApi": True},
-            },
-        }
-        if not _write_json_rpc(process.stdin, initialize):
-            return False, "", "could not write initialize request"
-        ok, _, detail = _read_json_rpc_response(process.stdout, 1, deadline)
-        if not ok:
-            return False, "", detail
-        if not _write_json_rpc(process.stdin, {"method": "initialized", "params": {}}):
-            return False, "", "could not write initialized notification"
-        if not _write_json_rpc(
-            process.stdin,
-            {
-                "id": 2,
-                "method": "thread/read",
-                "params": {"threadId": thread_id, "includeTurns": False},
-            },
-        ):
-            return False, "", "could not write thread/read request"
-        ok, result, detail = _read_json_rpc_response(process.stdout, 2, deadline)
-        if not ok:
-            return False, "", detail
-        thread = result.get("thread") if isinstance(result, dict) else None
-        name = thread.get("name") if isinstance(thread, dict) else None
-        if not isinstance(name, str) or not name.strip():
-            return False, "", "thread/read returned no Desktop thread name"
-        return True, name, ""
-    finally:
+        with AppServerClient(
+            [codex_bin, "app-server", "proxy"], timeout_ms, websocket=True
+        ) as client:
+            loaded = client.request("thread/loaded/list", {})
+            data = loaded.get("data") if isinstance(loaded, dict) else None
+            if not isinstance(data, list) or thread_id not in data:
+                return "not-loaded", "the session is not open on the shared app-server daemon"
+            result = client.request("thread/goal/get", {"threadId": thread_id})
+            goal = result.get("goal") if isinstance(result, dict) else None
+            status = goal.get("status") if isinstance(goal, dict) else None
+            if status is None:
+                return "no-goal", ""
+            if status not in {"active", "blocked"}:
+                return "goal-inactive", f"Goal status is {status}"
+            client.request(
+                "thread/goal/set",
+                {"threadId": thread_id, "status": "active", "origin": "automatic"},
+            )
+            return "goal-resumed", ""
+    except AppServerError as exc:
+        return "unavailable", str(exc)
+
+
+def stop_app_server(process: subprocess.Popen) -> None:
+    try:
+        process.stdin.close()  # type: ignore[union-attr]
+    except OSError:
+        pass
+    if IS_WINDOWS:
+        # An npm `codex.cmd` shim puts cmd.exe and node.exe between us and the
+        # app-server; terminate() would orphan them. EOF on stdin normally
+        # ends the app-server, so give it a moment before killing the tree.
         try:
-            process.stdin.close()
-        except OSError:
+            process.wait(timeout=1)
+            return
+        except subprocess.TimeoutExpired:
             pass
         try:
-            process.terminate()
-            process.wait(timeout=1)
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+                creationflags=NO_WINDOW,
+            )
         except (OSError, subprocess.TimeoutExpired):
-            process.kill()
-            process.wait()
+            pass
+    try:
+        process.terminate()
+        process.wait(timeout=1)
+    except (OSError, subprocess.TimeoutExpired):
+        process.kill()
+        process.wait()
+
+
+# Replaced in the Electron main process with whether the user is idle (or the
+# Desktop window is unfocused), so the renderer knows if it may switch threads.
+ALLOW_SWITCH_PLACEHOLDER = "__CODEX_AUTO_CONTINUE_ALLOW_SWITCH__"
 
 
 def _desktop_renderer_script(thread_title: str, prefer_goal: bool, wait_ms: int) -> str:
@@ -449,6 +901,7 @@ def _desktop_renderer_script(thread_title: str, prefer_goal: bool, wait_ms: int)
 (async () => {{
   const title = {title_literal};
   const preferGoal = {goal_literal};
+  const allowSwitch = {ALLOW_SWITCH_PLACEHOLDER};
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const visible = (element) => !!element && !!element.offsetParent;
   const aria = (value) => [...document.querySelectorAll('[aria-label]')]
@@ -485,6 +938,9 @@ def _desktop_renderer_script(thread_title: str, prefer_goal: bool, wait_ms: int)
   }};
   if (!sourceTitle) {{
     return {{ok: false, detail: 'Could not identify the currently selected Desktop thread; refusing to switch the UI'}};
+  }}
+  if (sourceTitle !== title && !allowSwitch) {{
+    return {{ok: false, detail: 'Deferring: the user is active in another Desktop thread'}};
   }}
   const thread = aria(title);
   if (thread) {{
@@ -529,10 +985,12 @@ def desktop_resume(
     prefer_goal: bool,
     inspector_port: int,
     timeout_ms: int,
+    windows_executables: Sequence[str] = DEFAULT_WINDOWS_DESKTOP_EXECUTABLES,
+    switch_idle_ms: int = DEFAULT_GOAL_SWITCH_IDLE_MS,
 ) -> tuple[bool, str]:
     """Use the same Desktop button the user would click, in the live UI."""
 
-    target, _, detail = ensure_node_inspector(inspector_port, timeout_ms)
+    target, _, detail = ensure_node_inspector(inspector_port, timeout_ms, windows_executables)
     if not target:
         return False, f"Desktop unavailable: {detail}"
     ok, title, detail = thread_name(codex_bin, thread_id, timeout_ms)
@@ -547,9 +1005,15 @@ def desktop_resume(
                 "const windows=e.BrowserWindow.getAllWindows();"
                 "const w=windows.find((candidate)=>candidate.isFocused())||windows[0];"
                 "if(!w)return {ok:false,detail:'no Desktop BrowserWindow'};"
+                # Switching threads while the user types in the focused window
+                # could send their keystrokes to the Goal thread, so only
+                # switch when Desktop is in the background or input is idle.
+                "let idle=null;try{idle=e.powerMonitor.getSystemIdleTime()*1000}catch(error){}"
+                f"const allow=!w.isFocused()||idle===null||idle>={switch_idle_ms};"
                 "try{return await w.webContents.executeJavaScript("
                 + json.dumps(_desktop_renderer_script(title, prefer_goal, 700), ensure_ascii=False)
-                + ",true)}catch(error){return {ok:false,detail:String(error)}}"
+                + f".replace({json.dumps(ALLOW_SWITCH_PLACEHOLDER)},String(allow)),true)"
+                "}catch(error){return {ok:false,detail:String(error)}}"
                 "})()"
             )
             websocket.send_json(
@@ -611,162 +1075,22 @@ def desktop_ui_unavailable(detail: str) -> bool:
     folded = detail.casefold()
     return (
         "thread is not visible in the sidebar" in folded
+        or "user is active in another desktop thread" in folded
         or "goal resume button is not visible" in folded
         or "desktop retry button is not visible" in folded
     )
-
-
-def _write_json_rpc(stream: TextIO, message: dict[str, object]) -> bool:
-    try:
-        stream.write(json.dumps(message, ensure_ascii=False) + "\n")
-        stream.flush()
-    except (BrokenPipeError, OSError):
-        return False
-    return True
-
-
-def _read_json_rpc_response(
-    stream: TextIO,
-    expected_id: int,
-    deadline: float,
-) -> tuple[bool, object | None, str]:
-    """Read JSON-RPC messages until the response for expected_id arrives."""
-
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False, None, "timed out waiting for app-server response"
-        try:
-            ready, _, _ = select.select([stream], [], [], remaining)
-        except (OSError, ValueError) as exc:
-            return False, None, str(exc)
-        if not ready:
-            return False, None, "timed out waiting for app-server response"
-        line = stream.readline()
-        if not line:
-            return False, None, "app-server closed its protocol stream"
-        try:
-            response = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(response, dict) or response.get("id") != expected_id:
-            continue
-        error = response.get("error")
-        if error is not None:
-            if isinstance(error, dict):
-                message = error.get("message") or error.get("code") or str(error)
-            else:
-                message = str(error)
-            return False, None, f"app-server error: {message}"
-        return True, response.get("result"), ""
-
-
-def goal_continue(
-    codex_bin: str,
-    thread_id: str,
-    *,
-    goal_active: bool | None,
-    timeout_ms: int,
-) -> tuple[bool, str]:
-    """Ask app-server to continue an existing active Goal without a user message.
-
-    Setting an active or transiently blocked Goal to ``active`` invokes Codex's
-    own Goal runtime continuation path. A transient turn failure can leave a
-    Goal in ``blocked`` (shown as stalled in Desktop), and the Goal Continue
-    control reactivates that state. When the log did not contain a recent Goal
-    event, query the current status so paused, limited, and completed Goals are
-    never resumed by accident.
-    """
-
-    command = [codex_bin, "app-server", "--listen", "stdio://"]
-    try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-    except OSError as exc:
-        return False, str(exc)
-
-    assert process.stdin is not None
-    assert process.stdout is not None
-    deadline = time.monotonic() + timeout_ms / 1000.0
-    try:
-        initialize = {
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "clientInfo": {
-                    "name": "codex-desktop-auto-continue",
-                    "title": "Codex Desktop Auto Continue",
-                    "version": VERSION,
-                },
-                "capabilities": {"experimentalApi": True},
-            },
-        }
-        if not _write_json_rpc(process.stdin, initialize):
-            return False, "could not write initialize request"
-        ok, _, detail = _read_json_rpc_response(process.stdout, 1, deadline)
-        if not ok:
-            return False, detail
-        if not _write_json_rpc(process.stdin, {"method": "initialized", "params": {}}):
-            return False, "could not write initialized notification"
-
-        current_status: str | None = "active" if goal_active is True else None
-        if current_status is None:
-            if not _write_json_rpc(
-                process.stdin,
-                {
-                    "id": 2,
-                    "method": "thread/goal/get",
-                    "params": {"threadId": thread_id},
-                },
-            ):
-                return False, "could not write thread/goal/get request"
-            ok, result, detail = _read_json_rpc_response(process.stdout, 2, deadline)
-            if not ok:
-                return False, detail
-            goal = result.get("goal") if isinstance(result, dict) else None
-            current_status = goal.get("status") if isinstance(goal, dict) else None
-            if current_status not in {"active", "blocked"}:
-                return False, f"Goal status is {current_status or 'none'}"
-
-        request_id = 3 if goal_active is None else 2
-        if not _write_json_rpc(
-            process.stdin,
-            {
-                "id": request_id,
-                "method": "thread/goal/set",
-                "params": {"threadId": thread_id, "status": "active"},
-            },
-        ):
-            return False, "could not write thread/goal/set request"
-        ok, _, detail = _read_json_rpc_response(process.stdout, request_id, deadline)
-        return (True, "") if ok else (False, detail)
-    finally:
-        try:
-            process.stdin.close()
-        except OSError:
-            pass
-        try:
-            process.terminate()
-            process.wait(timeout=1)
-        except (OSError, subprocess.TimeoutExpired):
-            process.kill()
-            process.wait()
 
 
 def acquire_lock(path: Path) -> TextIO:
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a+", encoding="utf-8")
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
+        if IS_WINDOWS:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
         handle.close()
         raise RuntimeError(f"another watcher already holds {path}") from exc
     handle.seek(0)
@@ -782,6 +1106,7 @@ def event_action(
     *,
     all_clients: bool,
     path: Path,
+    include_cli: bool = True,
 ) -> PendingContinuation | None:
     if record.get("type") == "session_meta":
         payload = record.get("payload")
@@ -814,7 +1139,15 @@ def event_action(
     reason = transient_reason(payload.get("error"))
     if reason is None or not state.thread_id:
         return None
-    if not all_clients and state.originator != "Codex Desktop":
+    if state.originator == DESKTOP_ORIGINATOR:
+        client = "desktop"
+    elif all_clients or (
+        include_cli
+        and state.originator is not None
+        and state.originator not in NON_INTERACTIVE_ORIGINATORS
+    ):
+        client = "cli"
+    else:
         return None
 
     event_key = f"{path}:{record.get('ordinal', state.offset)}"
@@ -826,7 +1159,9 @@ def event_action(
         goal_active = None
     else:
         goal_active = state.goal_status in {"active", "blocked"}
-    return PendingContinuation(event_key, state.thread_id, reason, goal_active=goal_active)
+    return PendingContinuation(
+        event_key, state.thread_id, reason, goal_active=goal_active, client=client
+    )
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -844,7 +1179,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--codex-bin",
-        default=shutil.which("codex") or "/usr/lib/chatgpt/resources/codex",
+        default=default_codex_bin(),
         help="Codex executable used for queue and Goal app-server calls.",
     )
     parser.add_argument("--message", default="continue", help="Message queued on the thread.")
@@ -894,6 +1229,30 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Loopback Node inspector port used for live Desktop buttons (default: 9229).",
     )
     parser.add_argument(
+        "--goal-switch-idle-ms",
+        type=int,
+        default=DEFAULT_GOAL_SWITCH_IDLE_MS,
+        help=(
+            "Only switch the focused Desktop window to a Goal thread after this much "
+            "keyboard/mouse idle time (default: 15000 ms)."
+        ),
+    )
+    parser.add_argument(
+        "--desktop-exe",
+        action="append",
+        default=None,
+        help=(
+            "Windows only: executable name of the Desktop main process; repeatable "
+            "(default: Codex.exe and ChatGPT.exe)."
+        ),
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Append log lines to this file instead of stderr (useful under pythonw.exe).",
+    )
+    parser.add_argument(
         "--no-desktop-ui",
         action="store_true",
         help="Explicitly disable live Desktop buttons and use the legacy queue fallback.",
@@ -909,9 +1268,14 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Process historical failures at startup; use with care.",
     )
     parser.add_argument(
+        "--desktop-only",
+        action="store_true",
+        help="Ignore interactive CLI (`codex`) sessions; handle Codex Desktop only.",
+    )
+    parser.add_argument(
         "--all-clients",
         action="store_true",
-        help="Include sessions not created by Codex Desktop.",
+        help="Also include non-interactive `codex exec` sessions.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Log actions without queueing.")
     parser.add_argument("--once", action="store_true", help="Run one scan and exit.")
@@ -927,11 +1291,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "app_server_timeout_ms",
         "desktop_unavailable_retry_ms",
         "desktop_ui_retry_ms",
+        "goal_switch_idle_ms",
     ):
         if getattr(args, name) < 10:
             parser.error(f"--{name.replace('_', '-')} must be at least 10")
     if args.inspector_port < 1 or args.inspector_port > 65535:
         parser.error("--inspector-port must be between 1 and 65535")
+    args.desktop_exe = tuple(args.desktop_exe or DEFAULT_WINDOWS_DESKTOP_EXECUTABLES)
     return args
 
 
@@ -941,6 +1307,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     states: dict[Path, FileState] = {}
     continuation_counts: dict[str, int] = {}
     pending: dict[str, PendingContinuation] = {}
+
+    if args.log_file is not None:
+        log_path = args.log_file.expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        sys.stderr = log_path.open("a", encoding="utf-8", buffering=1)
 
     try:
         lock_handle = acquire_lock(args.lock_file.expanduser())
@@ -985,6 +1356,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         state,
                         all_clients=args.all_clients,
                         path=path,
+                        include_cli=not args.desktop_only,
                     )
                     if action is not None:
                         pending[action.event_key] = action
@@ -1017,7 +1389,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     continue
 
                 if args.dry_run:
-                    if args.no_desktop_ui:
+                    if action.client == "cli":
+                        print(
+                            f"[codex-auto-continue] dry-run: would resume the Goal on CLI "
+                            f"session {action.thread_id} through the app-server daemon, or "
+                            f"queue {args.message!r} without a Goal",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    elif args.no_desktop_ui:
                         print(
                             f"[codex-auto-continue] dry-run: would queue "
                             f"{args.message!r} on {action.thread_id} without Desktop UI",
@@ -1042,18 +1422,89 @@ def main(argv: Sequence[str] | None = None) -> int:
                     del pending[event_key]
                     continue
 
+                if action.client == "cli":
+                    outcome, detail = daemon_resume(
+                        args.codex_bin,
+                        action.thread_id,
+                        timeout_ms=args.app_server_timeout_ms,
+                    )
+                    if outcome == "goal-resumed":
+                        continuation_counts[action.thread_id] = count + 1
+                        print(
+                            f"[codex-auto-continue] resumed CLI Goal on {action.thread_id} "
+                            f"after {action.reason} ({count + 1}/{args.max_attempts})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        del pending[event_key]
+                        continue
+                    if outcome in {"goal-inactive", "not-loaded"}:
+                        print(
+                            f"[codex-auto-continue] not continuing CLI session "
+                            f"{action.thread_id} after {action.reason}: {detail}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        del pending[event_key]
+                        continue
+                    if outcome == "unavailable":
+                        if action.attempts >= CLI_UNAVAILABLE_ATTEMPTS:
+                            print(
+                                f"[codex-auto-continue] app-server daemon stayed unavailable "
+                                f"for CLI session {action.thread_id}; giving up: {detail}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            del pending[event_key]
+                            continue
+                        action.next_attempt_at = (
+                            now + args.desktop_unavailable_retry_ms / 1000.0
+                        )
+                        if not action.desktop_unavailable_logged:
+                            print(
+                                f"[codex-auto-continue] app-server daemon is unavailable for "
+                                f"CLI session {action.thread_id}; retrying every "
+                                f"{args.desktop_unavailable_retry_ms} ms: {detail}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            action.desktop_unavailable_logged = True
+                        continue
+                    # no-goal: an ordinary turn, continued through the queue below.
+
                 use_desktop_ui = (
-                    not args.no_desktop_ui
+                    action.client == "desktop"
+                    and not args.no_desktop_ui
                     and action.goal_active is not False
                     and (not args.goal_desktop_ui or action.goal_active is True)
                 )
                 if use_desktop_ui:
+                    # A Desktop thread that the shared daemon hosts can resume its
+                    # Goal there without touching the UI at all.
+                    outcome, detail = daemon_resume(
+                        args.codex_bin,
+                        action.thread_id,
+                        timeout_ms=args.app_server_timeout_ms,
+                    )
+                    if outcome == "goal-resumed":
+                        continuation_counts[action.thread_id] = count + 1
+                        print(
+                            f"[codex-auto-continue] resumed Desktop Goal through the "
+                            f"app-server daemon on {action.thread_id} after {action.reason} "
+                            f"({count + 1}/{args.max_attempts})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        del pending[event_key]
+                        continue
                     ok, detail = desktop_resume(
                         args.codex_bin,
                         action.thread_id,
                         prefer_goal=action.goal_active is True,
                         inspector_port=args.inspector_port,
                         timeout_ms=args.app_server_timeout_ms,
+                        windows_executables=args.desktop_exe,
+                        switch_idle_ms=args.goal_switch_idle_ms,
                     )
                     if ok:
                         continuation_counts[action.thread_id] = count + 1
@@ -1117,11 +1568,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                         action.desktop_ui_wait_logged = True
                     continue
 
-                elif action.goal_active is True and not args.no_desktop_ui:
+                elif (
+                    action.client == "desktop"
+                    and action.goal_active is True
+                    and not args.no_desktop_ui
+                ):
                     action.next_attempt_at = now + args.queue_retry_ms / 1000.0
                     continue
 
-                if action.goal_active is True and not args.no_desktop_ui:
+                if (
+                    action.client == "desktop"
+                    and action.goal_active is True
+                    and not args.no_desktop_ui
+                ):
                     # The live Goal control is the only safe way to resume a Goal.  A
                     # queue message would be a new user turn and could lose the Goal's
                     # stateful continuation context, so keep the event pending.
