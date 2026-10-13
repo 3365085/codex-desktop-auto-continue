@@ -270,7 +270,13 @@ class SessionTests(unittest.TestCase):
         )
 
     def test_queue_command_success_path(self):
-        ok, detail = MODULE.queue_continue("/bin/true", self.thread_id, "continue")
+        if MODULE.IS_WINDOWS:
+            fake_codex = self.root / "codex.cmd"
+            fake_codex.write_text("@exit /b 0\r\n", encoding="ascii")
+            codex_bin = str(fake_codex)
+        else:
+            codex_bin = "/bin/true"
+        ok, detail = MODULE.queue_continue(codex_bin, self.thread_id, "continue")
         self.assertTrue(ok)
         self.assertEqual(detail, "")
 
@@ -550,6 +556,199 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(
             MODULE.is_chatgpt_main_command("ChatGPT", b"/usr/lib/chatgpt/ChatGPT --type=renderer")
         )
+
+
+class WindowsDesktopProcessTests(unittest.TestCase):
+    EXECUTABLES = ("Codex.exe", "ChatGPT.exe")
+    APP = "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.1.0.0_x64__2p2nqsd0c76g0\\app"
+
+    def test_picks_electron_main_over_bundled_cli_and_renderers(self):
+        processes = [
+            {
+                "ProcessId": 300,
+                "ParentProcessId": 100,
+                "Name": "codex.exe",
+                "ExecutablePath": self.APP + "\\resources\\codex.exe",
+                "CommandLine": '"codex.exe" app-server',
+            },
+            {
+                "ProcessId": 200,
+                "ParentProcessId": 100,
+                "Name": "Codex.exe",
+                "ExecutablePath": self.APP + "\\Codex.exe",
+                "CommandLine": '"Codex.exe" --type=renderer --lang=zh-CN',
+            },
+            {
+                "ProcessId": 100,
+                "ParentProcessId": 4,
+                "Name": "Codex.exe",
+                "ExecutablePath": self.APP + "\\Codex.exe",
+                "CommandLine": '"' + self.APP + '\\Codex.exe"',
+            },
+        ]
+        self.assertEqual(
+            MODULE.select_windows_desktop_main_pid(processes, self.EXECUTABLES), 100
+        )
+
+    def test_prefers_process_with_renderer_children(self):
+        processes = [
+            {"ProcessId": 10, "ParentProcessId": 1, "Name": "Codex.exe", "CommandLine": "Codex.exe"},
+            {"ProcessId": 20, "ParentProcessId": 1, "Name": "Codex.exe", "CommandLine": "Codex.exe"},
+            {
+                "ProcessId": 21,
+                "ParentProcessId": 20,
+                "Name": "Codex.exe",
+                "CommandLine": "Codex.exe --type=gpu-process",
+            },
+        ]
+        self.assertEqual(MODULE.select_windows_desktop_main_pid(processes, self.EXECUTABLES), 20)
+
+    def test_returns_none_without_desktop(self):
+        processes = [
+            {"ProcessId": 5, "ParentProcessId": 1, "Name": "notepad.exe", "CommandLine": "notepad"},
+            {
+                "ProcessId": 6,
+                "ParentProcessId": 1,
+                "Name": "Codex.exe",
+                "CommandLine": "Codex.exe --type=utility",
+            },
+        ]
+        self.assertIsNone(MODULE.select_windows_desktop_main_pid(processes, self.EXECUTABLES))
+
+
+class PortabilityTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _spawn(self, code):
+        return MODULE.subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdin=MODULE.subprocess.PIPE,
+            stdout=MODULE.subprocess.PIPE,
+            stderr=MODULE.subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+
+    def test_reads_json_rpc_response_from_real_pipe(self):
+        process = self._spawn(
+            "import json\n"
+            "print('not json', flush=True)\n"
+            "print(json.dumps({'id': 1, 'result': {}}), flush=True)\n"
+            "print(json.dumps({'id': 2, 'result': {'thread': {'name': '测试'}}}), flush=True)\n"
+            "input()\n"
+        )
+        try:
+            ok, result, detail = MODULE._read_json_rpc_response(
+                process.stdout, 2, MODULE.time.monotonic() + 10
+            )
+        finally:
+            MODULE.stop_app_server(process)
+        self.assertTrue(ok, detail)
+        self.assertEqual(result, {"thread": {"name": "测试"}})
+
+    def test_json_rpc_read_times_out_on_silent_pipe(self):
+        process = self._spawn("input()\n")
+        try:
+            started = MODULE.time.monotonic()
+            ok, _, detail = MODULE._read_json_rpc_response(process.stdout, 1, started + 0.3)
+        finally:
+            MODULE.stop_app_server(process)
+        self.assertFalse(ok)
+        self.assertIn("timed out", detail)
+        self.assertLess(MODULE.time.monotonic() - started, 5)
+
+    def test_second_watcher_cannot_take_lock(self):
+        path = self.root / "nested" / "watcher.lock"
+        first = MODULE.acquire_lock(path)
+        try:
+            with self.assertRaises(RuntimeError):
+                MODULE.acquire_lock(path)
+        finally:
+            first.close()
+        MODULE.acquire_lock(path).close()
+
+    def test_default_lock_file_resolves(self):
+        self.assertEqual(MODULE.default_lock_file().name, "watcher.lock")
+
+    def test_log_file_receives_output(self):
+        log_file = self.root / "logs" / "watcher.log"
+        original = sys.stderr
+        try:
+            code = MODULE.main(
+                [
+                    "--session-root",
+                    str(self.root / "sessions"),
+                    "--lock-file",
+                    str(self.root / "watcher.lock"),
+                    "--log-file",
+                    str(log_file),
+                    "--once",
+                    "--dry-run",
+                ]
+            )
+        finally:
+            if sys.stderr is not original:
+                sys.stderr.close()
+            sys.stderr = original
+        self.assertEqual(code, 0)
+        self.assertIn("[codex-auto-continue] watching", log_file.read_text(encoding="utf-8"))
+
+
+@unittest.skipUnless(MODULE.IS_WINDOWS and MODULE.shutil.which("node"), "Windows with Node.js only")
+class WindowsNodeInspectorTests(unittest.TestCase):
+    """Electron's main process is Node; a plain node.exe exercises the same path."""
+
+    def test_opens_inspector_on_running_node_process(self):
+        port = 9339
+        node = MODULE.subprocess.Popen(
+            ["node", f"--inspect-port={port}", "-e", "setInterval(() => {}, 1000)"],
+            stdin=MODULE.subprocess.DEVNULL,
+            stdout=MODULE.subprocess.DEVNULL,
+            stderr=MODULE.subprocess.DEVNULL,
+        )
+        try:
+            MODULE.time.sleep(1)
+            rows = MODULE.windows_desktop_processes(["node.exe"])
+            self.assertIn(node.pid, [row.get("ProcessId") for row in rows])
+            self.assertEqual(
+                MODULE.select_windows_desktop_main_pid(
+                    [row for row in rows if row.get("ProcessId") == node.pid], ["node.exe"]
+                ),
+                node.pid,
+            )
+            self.assertIsNone(MODULE.inspector_target(port, 250))
+            MODULE.windows_enable_inspector(node.pid)
+            deadline = MODULE.time.monotonic() + 10
+            target = None
+            while target is None and MODULE.time.monotonic() < deadline:
+                target = MODULE.inspector_target(port, 250)
+                MODULE.time.sleep(0.1)
+            self.assertIsNotNone(target)
+            websocket = MODULE.InspectorWebSocket(target, 5)
+            try:
+                websocket.send_json(
+                    {
+                        "id": 1,
+                        "method": "Runtime.evaluate",
+                        "params": {"expression": "1 + 41", "returnByValue": True},
+                    }
+                )
+                response = websocket.recv_json()
+                while response.get("id") != 1:
+                    response = websocket.recv_json()
+            finally:
+                websocket.close()
+            self.assertEqual(response["result"]["result"]["value"], 42)
+        finally:
+            node.kill()
+            node.wait()
 
 
 if __name__ == "__main__":

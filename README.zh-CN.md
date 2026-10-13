@@ -57,7 +57,7 @@ Codex Desktop 原线程
 
 ## 系统要求
 
-- Linux，具备 systemd 用户会话和 X11/桌面会话；
+- Linux，具备 systemd 用户会话和 X11/桌面会话；或 Windows 10/11（见下方“Windows”）；
 - Python 3.10 或更高版本；
 - Codex Desktop / ChatGPT Desktop，且与监视器使用同一个 Linux 用户；
 - Desktop 捆绑的 `codex` 可执行文件（安装器会自动寻找 `/usr/lib/chatgpt/resources/codex`，也支持 `PATH` 中的 `codex`）。
@@ -144,6 +144,8 @@ python3 codex_desktop_auto_continue.py \
 --desktop-unavailable-retry-ms N  Desktop 关闭时的挂起间隔；默认 30000 毫秒
 --desktop-ui-retry-ms N         Desktop 线程/按钮未渲染时的等待间隔；默认 5000 毫秒
 --inspector-port N         Desktop 本地 Node inspector 端口；默认 9229
+--desktop-exe NAME         仅 Windows：Desktop 主进程文件名，可重复；默认 Codex.exe、ChatGPT.exe
+--log-file PATH            日志追加写入文件而不是 stderr（pythonw.exe 下使用）
 --goal-desktop-ui           只有活动/阻塞 Goal 使用 Desktop 按钮，普通失败走 queue
 --no-desktop-ui             所有失败都使用同线程 queue continue，不操作 Desktop 界面
 --scan-existing            处理已有错误；对旧日志有误触发风险
@@ -152,6 +154,56 @@ python3 codex_desktop_auto_continue.py \
 --once                     扫描一次后退出
 --version                  显示版本
 ```
+
+## Windows
+
+Windows 版使用同一个 `codex_desktop_auto_continue.py`，差异只在平台层：
+
+| Linux | Windows |
+| --- | --- |
+| systemd 用户服务 | 当前用户登录时运行的计划任务（失败时回退到 HKCU Run 启动项），`pythonw.exe` 无窗口运行 |
+| 扫描 `/proc` 找 Electron 主进程 | `Get-CimInstance Win32_Process` 查找 `Codex.exe` / `ChatGPT.exe` 主进程（排除 `--type=` 子进程和 `resources\codex.exe`） |
+| `kill -USR1` 打开 Node inspector | 与 Node `process._debugProcess()` 相同的机制（`node-debug-handler-<pid>` + `CreateRemoteThread`） |
+| `fcntl` 文件锁 | `msvcrt` 文件锁，位于 `%LOCALAPPDATA%\codex-desktop-auto-continue` |
+| journalctl | `%LOCALAPPDATA%\codex-desktop-auto-continue\watcher.log` |
+
+要求：
+
+- Python 3.10+（python.org 安装版或 `py` 启动器）；
+- 可直接运行的 Codex CLI：`PATH` 中的 `codex`（如 `npm install -g @openai/codex`），或
+  `CODEX_CLI_PATH`，或安装时 `-CodexBin` 指定。Microsoft Store 包内
+  `WindowsApps\...\resources\codex.exe` 通常被包权限阻止直接启动，不建议使用；
+- 会话日志默认在 `%USERPROFILE%\.codex\sessions`。如果 Codex 应用设置为在 WSL 中运行
+  agent，会话写在 WSL 里，需要改用 Linux 版或用 `--session-root` 指向
+  `\\wsl$\<发行版>\home\<用户>\.codex\sessions`。
+
+安装（双击或在仓库目录执行）：
+
+```bat
+install.cmd
+```
+
+或在 PowerShell 中指定参数：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\windows\install.ps1 -CodexBin "C:\path\to\codex.exe"
+```
+
+查看日志：
+
+```powershell
+Get-Content -Wait -Tail 50 "$env:LOCALAPPDATA\codex-desktop-auto-continue\watcher.log"
+```
+
+卸载：双击 `uninstall.cmd`。
+
+Windows 下的已知限制：
+
+- Goal 恢复依赖 Electron 主进程允许打开 Node inspector。若 Codex 的 Windows 构建关闭了
+  该能力（Electron fuse），日志会出现 `could not enable Desktop inspector`；此时普通对话的
+  queue 继续仍可用，Goal 会保持等待。
+- Goal 按钮按 aria-label `恢复目标` / `暂停目标` 识别，即需要 Desktop 使用中文界面。
+- Python 与 Codex 必须同为 64 位（或同为 ARM64），否则无法创建远程线程。
 
 ## 卸载
 

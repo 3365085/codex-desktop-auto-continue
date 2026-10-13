@@ -5,17 +5,17 @@ from __future__ import annotations
 
 import argparse
 import base64
-import fcntl
 import json
 import os
+import queue
 import re
-import select
 import signal
 import shutil
 import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -24,7 +24,15 @@ from pathlib import Path
 from typing import Iterator, Sequence, TextIO
 
 
-VERSION = "0.3.4"
+IS_WINDOWS = os.name == "nt"
+
+if IS_WINDOWS:
+    import msvcrt
+else:
+    import fcntl
+
+
+VERSION = "0.4.0"
 DEFAULT_DESKTOP_UNAVAILABLE_RETRY_MS = 30_000
 DEFAULT_DESKTOP_UI_RETRY_MS = 5_000
 
@@ -47,6 +55,14 @@ TRANSIENT_TEXT = (
     "response stream connection failed",
     "response stream disconnected",
 )
+
+# Executable names of the Electron main process on Windows. The Microsoft Store
+# Codex app ships `Codex.exe`; `ChatGPT.exe` covers the ChatGPT-branded build.
+DEFAULT_WINDOWS_DESKTOP_EXECUTABLES = ("Codex.exe", "ChatGPT.exe")
+
+# Console programs such as codex.exe and powershell.exe would otherwise flash a
+# window for every call when the watcher runs under pythonw.exe.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 THREAD_ID_RE = re.compile(
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$",
@@ -185,9 +201,22 @@ def default_codex_home() -> Path:
 
 
 def default_lock_file() -> Path:
+    if IS_WINDOWS:
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+        return base / "codex-desktop-auto-continue" / "watcher.lock"
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
     base = Path(runtime_dir) if runtime_dir else Path("/tmp") / f"codex-auto-continue-{os.getuid()}"
     return base / "watcher.lock"
+
+
+def default_codex_bin() -> str:
+    if IS_WINDOWS:
+        configured = os.environ.get("CODEX_CLI_PATH")
+        if configured:
+            return configured
+        return shutil.which("codex") or "codex"
+    return shutil.which("codex") or "/usr/lib/chatgpt/resources/codex"
 
 
 def inspector_target(port: int, timeout_ms: int) -> str | None:
@@ -220,8 +249,182 @@ def is_chatgpt_main_command(executable: str, raw_cmdline: bytes) -> bool:
     return not re.search(r"(?:^|\s)--type=", command_line)
 
 
-def chatgpt_main_pid() -> int | None:
+def select_windows_desktop_main_pid(
+    processes: Sequence[dict[str, object]],
+    executables: Sequence[str],
+) -> int | None:
+    """Pick the Electron main process from Win32_Process rows.
+
+    The Codex CLI bundled under ``app\\resources`` is also named ``codex.exe``
+    and Windows names are case-insensitive, so exclude anything under a
+    ``resources`` directory and prefer the process that owns ``--type=``
+    Chromium children.
+    """
+
+    names = {name.casefold() for name in executables}
+    child_type = re.compile(r"(?:^|\s)--type=")
+    rows: list[tuple[int, int | None, str, str, str]] = []
+    for row in processes:
+        try:
+            pid = int(row.get("ProcessId"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        try:
+            parent: int | None = int(row.get("ParentProcessId"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            parent = None
+        rows.append(
+            (
+                pid,
+                parent,
+                str(row.get("Name") or "").casefold(),
+                str(row.get("ExecutablePath") or "").casefold().replace("/", "\\"),
+                str(row.get("CommandLine") or ""),
+            )
+        )
+
+    candidates = [
+        pid
+        for pid, _, name, executable, command_line in rows
+        if name in names
+        and not child_type.search(command_line)
+        and "\\resources\\" not in executable
+    ]
+    for pid in candidates:
+        if any(
+            parent == pid and child_type.search(command_line)
+            for _, parent, _, _, command_line in rows
+        ):
+            return pid
+    return candidates[0] if candidates else None
+
+
+def windows_desktop_processes(executables: Sequence[str]) -> list[dict[str, object]]:
+    """List candidate Desktop processes with their command lines."""
+
+    names = {name for name in executables if re.fullmatch(r"[\w.\- ]+", name)}
+    if not names:
+        return []
+    # Children are needed too, to tell the main process from the bundled CLI.
+    script = (
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+        "$rows=@(Get-CimInstance Win32_Process -Filter \""
+        + " OR ".join(f"Name='{name}'" for name in sorted(names))
+        + "\" | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine);"
+        "ConvertTo-Json -InputObject $rows -Compress -Depth 2"
+    )
+    # -EncodedCommand sidesteps cmd-line quoting rules for the embedded quotes.
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+            creationflags=NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    text = completed.stdout.decode("utf-8", errors="replace").strip()
+    if not text:
+        return []
+    try:
+        rows = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(rows, dict):
+        rows = [rows]
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def windows_enable_inspector(pid: int) -> None:
+    """Windows equivalent of ``kill -USR1``: Node's ``process._debugProcess``.
+
+    Node exposes a per-process file mapping holding the address of its debug
+    handler; running that handler on a remote thread opens the inspector on
+    127.0.0.1:9229, exactly as SIGUSR1 does on Linux.
+    """
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenFileMappingW.restype = wintypes.HANDLE
+    kernel32.OpenFileMappingW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.MapViewOfFile.restype = ctypes.c_void_p
+    kernel32.MapViewOfFile.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_size_t,
+    ]
+    kernel32.UnmapViewOfFile.argtypes = [ctypes.c_void_p]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.CreateRemoteThread.restype = wintypes.HANDLE
+    kernel32.CreateRemoteThread.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    ]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    file_map_read = 0x0004
+    access = 0x0002 | 0x0400 | 0x0008 | 0x0020 | 0x0010  # create thread, query, VM op/write/read
+
+    def failure(step: str) -> OSError:
+        code = ctypes.get_last_error()
+        return OSError(code, f"{step} failed: {ctypes.FormatError(code).strip()}")
+
+    mapping = kernel32.OpenFileMappingW(file_map_read, False, f"node-debug-handler-{pid}")
+    if not mapping:
+        raise failure("opening the Node debug handler (inspector may be disabled)")
+    try:
+        view = kernel32.MapViewOfFile(mapping, file_map_read, 0, 0, ctypes.sizeof(ctypes.c_void_p))
+        if not view:
+            raise failure("MapViewOfFile")
+        try:
+            handler = ctypes.c_void_p.from_address(view).value
+        finally:
+            kernel32.UnmapViewOfFile(view)
+    finally:
+        kernel32.CloseHandle(mapping)
+    if not handler:
+        raise OSError("Node debug handler address is empty")
+
+    process = kernel32.OpenProcess(access, False, pid)
+    if not process:
+        raise failure("OpenProcess")
+    try:
+        thread = kernel32.CreateRemoteThread(process, None, 0, handler, None, 0, None)
+        if not thread:
+            raise failure("CreateRemoteThread")
+        try:
+            kernel32.WaitForSingleObject(thread, 5000)
+        finally:
+            kernel32.CloseHandle(thread)
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def chatgpt_main_pid(
+    windows_executables: Sequence[str] = DEFAULT_WINDOWS_DESKTOP_EXECUTABLES,
+) -> int | None:
     """Find the Electron main process without matching renderer children."""
+
+    if IS_WINDOWS:
+        return select_windows_desktop_main_pid(
+            windows_desktop_processes(windows_executables), windows_executables
+        )
 
     for entry in Path("/proc").glob("[0-9]*"):
         try:
@@ -242,17 +445,24 @@ def chatgpt_main_pid() -> int | None:
     return None
 
 
-def ensure_node_inspector(port: int, timeout_ms: int) -> tuple[str | None, bool, str]:
+def ensure_node_inspector(
+    port: int,
+    timeout_ms: int,
+    windows_executables: Sequence[str] = DEFAULT_WINDOWS_DESKTOP_EXECUTABLES,
+) -> tuple[str | None, bool, str]:
     """Open the loopback-only Electron inspector on demand when needed."""
 
     existing = inspector_target(port, timeout_ms)
     if existing:
         return existing, False, ""
-    pid = chatgpt_main_pid()
+    pid = chatgpt_main_pid(windows_executables)
     if pid is None:
         return None, False, "Codex Desktop main process was not found"
     try:
-        os.kill(pid, signal.SIGUSR1)
+        if IS_WINDOWS:
+            windows_enable_inspector(pid)
+        else:
+            os.kill(pid, signal.SIGUSR1)
     except OSError as exc:
         return None, False, f"could not enable Desktop inspector: {exc}"
     deadline = time.monotonic() + timeout_ms / 1000.0
@@ -363,6 +573,7 @@ def queue_continue(codex_bin: str, thread_id: str, message: str) -> tuple[bool, 
             encoding="utf-8",
             errors="replace",
             check=False,
+            creationflags=NO_WINDOW,
         )
     except OSError as exc:
         return False, str(exc)
@@ -385,6 +596,7 @@ def thread_name(codex_bin: str, thread_id: str, timeout_ms: int) -> tuple[bool, 
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            creationflags=NO_WINDOW,
         )
     except OSError as exc:
         return False, "", str(exc)
@@ -430,16 +642,42 @@ def thread_name(codex_bin: str, thread_id: str, timeout_ms: int) -> tuple[bool, 
             return False, "", "thread/read returned no Desktop thread name"
         return True, name, ""
     finally:
+        stop_app_server(process)
+
+
+def stop_app_server(process: subprocess.Popen) -> None:
+    try:
+        process.stdin.close()  # type: ignore[union-attr]
+    except OSError:
+        pass
+    _LINE_READERS.pop(id(process.stdout), None)
+    if IS_WINDOWS:
+        # An npm `codex.cmd` shim puts cmd.exe and node.exe between us and the
+        # app-server; terminate() would orphan them. EOF on stdin normally
+        # ends the app-server, so give it a moment before killing the tree.
         try:
-            process.stdin.close()
-        except OSError:
+            process.wait(timeout=1)
+            return
+        except subprocess.TimeoutExpired:
             pass
         try:
-            process.terminate()
-            process.wait(timeout=1)
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+                creationflags=NO_WINDOW,
+            )
         except (OSError, subprocess.TimeoutExpired):
-            process.kill()
-            process.wait()
+            pass
+    try:
+        process.terminate()
+        process.wait(timeout=1)
+    except (OSError, subprocess.TimeoutExpired):
+        process.kill()
+        process.wait()
 
 
 def _desktop_renderer_script(thread_title: str, prefer_goal: bool, wait_ms: int) -> str:
@@ -529,10 +767,11 @@ def desktop_resume(
     prefer_goal: bool,
     inspector_port: int,
     timeout_ms: int,
+    windows_executables: Sequence[str] = DEFAULT_WINDOWS_DESKTOP_EXECUTABLES,
 ) -> tuple[bool, str]:
     """Use the same Desktop button the user would click, in the live UI."""
 
-    target, _, detail = ensure_node_inspector(inspector_port, timeout_ms)
+    target, _, detail = ensure_node_inspector(inspector_port, timeout_ms, windows_executables)
     if not target:
         return False, f"Desktop unavailable: {detail}"
     ok, title, detail = thread_name(codex_bin, thread_id, timeout_ms)
@@ -625,6 +864,39 @@ def _write_json_rpc(stream: TextIO, message: dict[str, object]) -> bool:
     return True
 
 
+# Pipes are read on a helper thread and handed over through a queue: select()
+# only accepts sockets on Windows, and on POSIX it cannot see lines that a
+# TextIOWrapper already buffered (several JSON-RPC messages in one chunk).
+_LINE_READERS: dict[int, "queue.Queue[str]"] = {}
+
+
+def _line_queue(stream: TextIO) -> "queue.Queue[str]":
+    lines = _LINE_READERS.get(id(stream))
+    if lines is None:
+        lines = queue.Queue()
+
+        def pump() -> None:
+            try:
+                for line in iter(stream.readline, ""):
+                    lines.put(line)
+            except (OSError, ValueError):
+                pass
+            lines.put("")
+
+        threading.Thread(target=pump, daemon=True).start()
+        _LINE_READERS[id(stream)] = lines
+    return lines
+
+
+def _readline(stream: TextIO, timeout: float) -> str | None:
+    """Return the next line, "" at EOF, or None on timeout."""
+
+    try:
+        return _line_queue(stream).get(timeout=timeout)
+    except queue.Empty:
+        return None
+
+
 def _read_json_rpc_response(
     stream: TextIO,
     expected_id: int,
@@ -637,12 +909,11 @@ def _read_json_rpc_response(
         if remaining <= 0:
             return False, None, "timed out waiting for app-server response"
         try:
-            ready, _, _ = select.select([stream], [], [], remaining)
+            line = _readline(stream, remaining)
         except (OSError, ValueError) as exc:
             return False, None, str(exc)
-        if not ready:
+        if line is None:
             return False, None, "timed out waiting for app-server response"
-        line = stream.readline()
         if not line:
             return False, None, "app-server closed its protocol stream"
         try:
@@ -689,6 +960,7 @@ def goal_continue(
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            creationflags=NO_WINDOW,
         )
     except OSError as exc:
         return False, str(exc)
@@ -749,24 +1021,19 @@ def goal_continue(
         ok, _, detail = _read_json_rpc_response(process.stdout, request_id, deadline)
         return (True, "") if ok else (False, detail)
     finally:
-        try:
-            process.stdin.close()
-        except OSError:
-            pass
-        try:
-            process.terminate()
-            process.wait(timeout=1)
-        except (OSError, subprocess.TimeoutExpired):
-            process.kill()
-            process.wait()
+        stop_app_server(process)
 
 
 def acquire_lock(path: Path) -> TextIO:
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a+", encoding="utf-8")
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
+        if IS_WINDOWS:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
         handle.close()
         raise RuntimeError(f"another watcher already holds {path}") from exc
     handle.seek(0)
@@ -844,7 +1111,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--codex-bin",
-        default=shutil.which("codex") or "/usr/lib/chatgpt/resources/codex",
+        default=default_codex_bin(),
         help="Codex executable used for queue and Goal app-server calls.",
     )
     parser.add_argument("--message", default="continue", help="Message queued on the thread.")
@@ -894,6 +1161,21 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Loopback Node inspector port used for live Desktop buttons (default: 9229).",
     )
     parser.add_argument(
+        "--desktop-exe",
+        action="append",
+        default=None,
+        help=(
+            "Windows only: executable name of the Desktop main process; repeatable "
+            "(default: Codex.exe and ChatGPT.exe)."
+        ),
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Append log lines to this file instead of stderr (useful under pythonw.exe).",
+    )
+    parser.add_argument(
         "--no-desktop-ui",
         action="store_true",
         help="Explicitly disable live Desktop buttons and use the legacy queue fallback.",
@@ -932,6 +1214,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be at least 10")
     if args.inspector_port < 1 or args.inspector_port > 65535:
         parser.error("--inspector-port must be between 1 and 65535")
+    args.desktop_exe = tuple(args.desktop_exe or DEFAULT_WINDOWS_DESKTOP_EXECUTABLES)
     return args
 
 
@@ -941,6 +1224,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     states: dict[Path, FileState] = {}
     continuation_counts: dict[str, int] = {}
     pending: dict[str, PendingContinuation] = {}
+
+    if args.log_file is not None:
+        log_path = args.log_file.expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        sys.stderr = log_path.open("a", encoding="utf-8", buffering=1)
 
     try:
         lock_handle = acquire_lock(args.lock_file.expanduser())
@@ -1054,6 +1342,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         prefer_goal=action.goal_active is True,
                         inspector_port=args.inspector_port,
                         timeout_ms=args.app_server_timeout_ms,
+                        windows_executables=args.desktop_exe,
                     )
                     if ok:
                         continuation_counts[action.thread_id] = count + 1
