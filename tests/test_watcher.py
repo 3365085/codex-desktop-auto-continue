@@ -542,6 +542,17 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(MODULE.desktop_ui_unavailable("Desktop retry button is not visible"))
         self.assertFalse(MODULE.desktop_ui_unavailable("Desktop inspector timed out"))
 
+    def test_goal_switch_waits_for_idle_user(self):
+        script = MODULE._desktop_renderer_script("Goal thread", True, 700)
+        self.assertIn(MODULE.ALLOW_SWITCH_PLACEHOLDER, script)
+        guard = script.index("if (sourceTitle !== title && !allowSwitch)")
+        self.assertLess(guard, script.index("thread.click()"))
+        self.assertTrue(
+            MODULE.desktop_ui_unavailable(
+                "Deferring: the user is active in another Desktop thread"
+            )
+        )
+
     def test_finds_chatgpt_main_in_single_string_cmdline(self):
         self.assertTrue(
             MODULE.is_chatgpt_main_command(

@@ -35,6 +35,7 @@ else:
 VERSION = "0.4.0"
 DEFAULT_DESKTOP_UNAVAILABLE_RETRY_MS = 30_000
 DEFAULT_DESKTOP_UI_RETRY_MS = 5_000
+DEFAULT_GOAL_SWITCH_IDLE_MS = 15_000
 
 TRANSIENT_CODES = frozenset(
     {
@@ -680,6 +681,11 @@ def stop_app_server(process: subprocess.Popen) -> None:
         process.wait()
 
 
+# Replaced in the Electron main process with whether the user is idle (or the
+# Desktop window is unfocused), so the renderer knows if it may switch threads.
+ALLOW_SWITCH_PLACEHOLDER = "__CODEX_AUTO_CONTINUE_ALLOW_SWITCH__"
+
+
 def _desktop_renderer_script(thread_title: str, prefer_goal: bool, wait_ms: int) -> str:
     title_literal = json.dumps(thread_title, ensure_ascii=False)
     goal_literal = "true" if prefer_goal else "false"
@@ -687,6 +693,7 @@ def _desktop_renderer_script(thread_title: str, prefer_goal: bool, wait_ms: int)
 (async () => {{
   const title = {title_literal};
   const preferGoal = {goal_literal};
+  const allowSwitch = {ALLOW_SWITCH_PLACEHOLDER};
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const visible = (element) => !!element && !!element.offsetParent;
   const aria = (value) => [...document.querySelectorAll('[aria-label]')]
@@ -723,6 +730,9 @@ def _desktop_renderer_script(thread_title: str, prefer_goal: bool, wait_ms: int)
   }};
   if (!sourceTitle) {{
     return {{ok: false, detail: 'Could not identify the currently selected Desktop thread; refusing to switch the UI'}};
+  }}
+  if (sourceTitle !== title && !allowSwitch) {{
+    return {{ok: false, detail: 'Deferring: the user is active in another Desktop thread'}};
   }}
   const thread = aria(title);
   if (thread) {{
@@ -768,6 +778,7 @@ def desktop_resume(
     inspector_port: int,
     timeout_ms: int,
     windows_executables: Sequence[str] = DEFAULT_WINDOWS_DESKTOP_EXECUTABLES,
+    switch_idle_ms: int = DEFAULT_GOAL_SWITCH_IDLE_MS,
 ) -> tuple[bool, str]:
     """Use the same Desktop button the user would click, in the live UI."""
 
@@ -786,9 +797,15 @@ def desktop_resume(
                 "const windows=e.BrowserWindow.getAllWindows();"
                 "const w=windows.find((candidate)=>candidate.isFocused())||windows[0];"
                 "if(!w)return {ok:false,detail:'no Desktop BrowserWindow'};"
+                # Switching threads while the user types in the focused window
+                # could send their keystrokes to the Goal thread, so only
+                # switch when Desktop is in the background or input is idle.
+                "let idle=null;try{idle=e.powerMonitor.getSystemIdleTime()*1000}catch(error){}"
+                f"const allow=!w.isFocused()||idle===null||idle>={switch_idle_ms};"
                 "try{return await w.webContents.executeJavaScript("
                 + json.dumps(_desktop_renderer_script(title, prefer_goal, 700), ensure_ascii=False)
-                + ",true)}catch(error){return {ok:false,detail:String(error)}}"
+                + f".replace({json.dumps(ALLOW_SWITCH_PLACEHOLDER)},String(allow)),true)"
+                "}catch(error){return {ok:false,detail:String(error)}}"
                 "})()"
             )
             websocket.send_json(
@@ -850,6 +867,7 @@ def desktop_ui_unavailable(detail: str) -> bool:
     folded = detail.casefold()
     return (
         "thread is not visible in the sidebar" in folded
+        or "user is active in another desktop thread" in folded
         or "goal resume button is not visible" in folded
         or "desktop retry button is not visible" in folded
     )
@@ -1161,6 +1179,15 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Loopback Node inspector port used for live Desktop buttons (default: 9229).",
     )
     parser.add_argument(
+        "--goal-switch-idle-ms",
+        type=int,
+        default=DEFAULT_GOAL_SWITCH_IDLE_MS,
+        help=(
+            "Only switch the focused Desktop window to a Goal thread after this much "
+            "keyboard/mouse idle time (default: 15000 ms)."
+        ),
+    )
+    parser.add_argument(
         "--desktop-exe",
         action="append",
         default=None,
@@ -1209,6 +1236,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "app_server_timeout_ms",
         "desktop_unavailable_retry_ms",
         "desktop_ui_retry_ms",
+        "goal_switch_idle_ms",
     ):
         if getattr(args, name) < 10:
             parser.error(f"--{name.replace('_', '-')} must be at least 10")
@@ -1343,6 +1371,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         inspector_port=args.inspector_port,
                         timeout_ms=args.app_server_timeout_ms,
                         windows_executables=args.desktop_exe,
+                        switch_idle_ms=args.goal_switch_idle_ms,
                     )
                     if ok:
                         continuation_counts[action.thread_id] = count + 1

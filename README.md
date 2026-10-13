@@ -62,6 +62,12 @@ If a transient turn failure leaves the Goal `blocked` (shown as stalled in
 Desktop), the watcher clicks the Goal bar's Resume button just like a user.
 Manually paused, completed, or usage-limited Goals are not resumed automatically.
 
+To stay out of your way, the watcher never switches threads while you are
+using Desktop: if the Goal thread is not the selected one and the Desktop
+window is focused with keyboard/mouse input in the last 15 seconds, the click
+is deferred (retried every 5 s) until you are idle or in another app. It then
+selects the Goal thread, clicks Resume, and switches straight back.
+
 ## Requirements
 
 - Linux with a systemd user session, or Windows 10/11 (see [Windows](#windows))
@@ -155,6 +161,7 @@ See [Effect and limitations](docs/effect-and-limitations.md) and
 --desktop-unavailable-retry-ms N Delay while Desktop is closed; default: 30000 ms
 --desktop-ui-retry-ms N       Delay while the thread/button is not rendered; default: 5000 ms
 --inspector-port N        Local Desktop Node inspector port; default: 9229
+--goal-switch-idle-ms N   Focused Desktop: input idle time required before switching to a Goal thread; default: 15000 ms
 --desktop-exe NAME        Windows only: Desktop main executable, repeatable; default: Codex.exe, ChatGPT.exe
 --log-file PATH           Append logs to a file instead of stderr (for pythonw.exe)
 --goal-desktop-ui         Use Desktop UI only for active/blocked Goals; queue ordinary failures

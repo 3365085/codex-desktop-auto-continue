@@ -51,6 +51,10 @@ Codex Desktop 原线程
 
 如果本轮暂时性失败让 Goal 变成 Desktop 中显示的“目标已停滞”，监视器会点击顶部“恢复目标”。手动暂停、完成或受用量限制的 Goal 不会被擅自恢复；只有会话日志中已经是 active/blocked 的目标才会自动处理。
 
+为了不干扰前台对话：如果 Goal 所在线程不是当前选中的线程，而 Desktop 窗口正处于前台且
+最近 15 秒内有键盘/鼠标操作，监视器会暂缓点击，每 5 秒重试，直到你空闲或切到别的程序后
+才切过去点“恢复目标”并立即切回原线程。普通对话失败始终走 queue，不碰界面。
+
 ## 普通线程为什么点击“重试”
 
 重复原始问题会把未完成的工作重新解释成一个新任务，可能重复执行命令、重复修改文件或覆盖已有判断。Desktop 错误卡片的“重试”是官方针对失败轮次的动作，监视器点击它而不是重发原始问题，所以不会把已经落盘的修改变成一次新的用户请求。
@@ -144,6 +148,7 @@ python3 codex_desktop_auto_continue.py \
 --desktop-unavailable-retry-ms N  Desktop 关闭时的挂起间隔；默认 30000 毫秒
 --desktop-ui-retry-ms N         Desktop 线程/按钮未渲染时的等待间隔；默认 5000 毫秒
 --inspector-port N         Desktop 本地 Node inspector 端口；默认 9229
+--goal-switch-idle-ms N     Desktop 窗口在前台时，键鼠空闲多久才允许切到 Goal 线程；默认 15000 毫秒
 --desktop-exe NAME         仅 Windows：Desktop 主进程文件名，可重复；默认 Codex.exe、ChatGPT.exe
 --log-file PATH            日志追加写入文件而不是 stderr（pythonw.exe 下使用）
 --goal-desktop-ui           只有活动/阻塞 Goal 使用 Desktop 按钮，普通失败走 queue
