@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: python -m py_compile codex_desktop_auto_continue.py
+      - run: python -m unittest discover -s tests -v
+
+  windows-installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install with a stand-in Codex CLI
+        shell: pwsh
+        run: |
+          $fake = Join-Path $env:RUNNER_TEMP 'codex.cmd'
+          Set-Content -Path $fake -Value '@exit /b 0' -Encoding ascii
+          & .\windows\install.ps1 -CodexBin $fake
+          Start-Sleep -Seconds 5
+          $watcher = Join-Path $env:LOCALAPPDATA 'codex-desktop-auto-continue\codex_desktop_auto_continue.py'
+          $running = Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
+            Where-Object { $_.CommandLine -and $_.CommandLine.Contains($watcher) }
+          if (-not $running) { throw 'watcher is not running' }
+          $log = Join-Path $env:LOCALAPPDATA 'codex-desktop-auto-continue\watcher.log'
+          Get-Content $log
+          if (-not (Select-String -Path $log -Pattern 'watching' -Quiet)) { throw 'watcher did not log startup' }
+      - name: Reinstall replaces the running watcher
+        shell: pwsh
+        run: |
+          $fake = Join-Path $env:RUNNER_TEMP 'codex.cmd'
+          & .\windows\install.ps1 -CodexBin $fake
+          Start-Sleep -Seconds 5
+          $watcher = Join-Path $env:LOCALAPPDATA 'codex-desktop-auto-continue\codex_desktop_auto_continue.py'
+          $running = @(Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
+            Where-Object { $_.CommandLine -and $_.CommandLine.Contains($watcher) })
+          if ($running.Count -ne 1) { throw "expected one watcher, found $($running.Count)" }
+      - name: Uninstall
+        shell: pwsh
+        run: |
+          & .\windows\uninstall.ps1
+          if (Test-Path (Join-Path $env:LOCALAPPDATA 'codex-desktop-auto-continue')) { throw 'install dir left behind' }
+          $watcher = 'codex-desktop-auto-continue\codex_desktop_auto_continue.py'
+          $running = Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
+            Where-Object { $_.CommandLine -and $_.CommandLine.Contains($watcher) }
+          if ($running) { throw 'watcher still running' }
