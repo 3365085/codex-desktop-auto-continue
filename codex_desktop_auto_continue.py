@@ -36,6 +36,13 @@ VERSION = "0.4.0"
 DEFAULT_DESKTOP_UNAVAILABLE_RETRY_MS = 30_000
 DEFAULT_DESKTOP_UI_RETRY_MS = 5_000
 DEFAULT_GOAL_SWITCH_IDLE_MS = 15_000
+# Daemon probes for a CLI event before it is dropped (about 10 minutes at the
+# default --desktop-unavailable-retry-ms).
+CLI_UNAVAILABLE_ATTEMPTS = 20
+
+DESKTOP_ORIGINATOR = "Codex Desktop"
+# One-shot `codex exec` runs leave no interactive session to continue.
+NON_INTERACTIVE_ORIGINATORS = frozenset({"codex_exec"})
 
 TRANSIENT_CODES = frozenset(
     {
@@ -88,14 +95,46 @@ class PendingContinuation:
     thread_id: str
     reason: str
     goal_active: bool | None = None
+    client: str = "desktop"
     attempts: int = 0
     next_attempt_at: float = 0.0
     desktop_unavailable_logged: bool = False
     desktop_ui_wait_logged: bool = False
 
 
+class AppServerError(RuntimeError):
+    """An app-server connection or JSON-RPC request failed."""
+
+
 class WebSocketError(RuntimeError):
     """The local Node inspector could not be used."""
+
+
+def websocket_frame(opcode: int, data: bytes) -> bytes:
+    """Build one masked client frame."""
+
+    mask = os.urandom(4)
+    masked = bytes(value ^ mask[index % 4] for index, value in enumerate(data))
+    length = len(data)
+    if length < 126:
+        header = bytes((0x80 | opcode, 0x80 | length))
+    elif length < 65536:
+        header = bytes((0x80 | opcode, 0x80 | 126)) + struct.pack("!H", length)
+    else:
+        header = bytes((0x80 | opcode, 0x80 | 127)) + struct.pack("!Q", length)
+    return header + mask + masked
+
+
+def websocket_handshake(host: str, path: str) -> bytes:
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    return (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    ).encode("ascii")
 
 
 class InspectorWebSocket:
@@ -111,16 +150,7 @@ class InspectorWebSocket:
         self.timeout = timeout
         self.sock = socket.create_connection((self.host, self.port), timeout=timeout)
         self.sock.settimeout(timeout)
-        key = base64.b64encode(os.urandom(16)).decode("ascii")
-        request = (
-            f"GET {self.path} HTTP/1.1\r\n"
-            f"Host: {self.host}:{self.port}\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n"
-        ).encode("ascii")
-        self.sock.sendall(request)
+        self.sock.sendall(websocket_handshake(f"{self.host}:{self.port}", self.path))
         header = self._read_until(b"\r\n\r\n")
         if not header.startswith(b"HTTP/1.1 101"):
             self.close()
@@ -137,16 +167,7 @@ class InspectorWebSocket:
 
     def send_json(self, payload: dict[str, object]) -> None:
         data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        mask = os.urandom(4)
-        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(data))
-        length = len(data)
-        if length < 126:
-            header = bytes((0x81, 0x80 | length))
-        elif length < 65536:
-            header = bytes((0x81, 0x80 | 126)) + struct.pack("!H", length)
-        else:
-            header = bytes((0x81, 0x80 | 127)) + struct.pack("!Q", length)
-        self.sock.sendall(header + mask + masked)
+        self.sock.sendall(websocket_frame(0x1, data))
 
     def recv_json(self) -> dict[str, object]:
         first = self._recv_exact(2)
@@ -185,9 +206,7 @@ class InspectorWebSocket:
         return bytes(data)
 
     def _send_control(self, opcode: int, data: bytes) -> None:
-        mask = os.urandom(4)
-        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(data))
-        self.sock.sendall(bytes((0x80 | opcode, 0x80 | len(data))) + mask + masked)
+        self.sock.sendall(websocket_frame(opcode, data))
 
     def close(self) -> None:
         try:
@@ -479,11 +498,35 @@ def clean_text(value: object) -> str:
     return str(value).casefold()
 
 
+def error_code(info: object) -> tuple[str | None, int | None]:
+    """Split ``codex_error_info`` into its name and HTTP status.
+
+    Unit variants are logged as a string (``"server_overloaded"``); variants
+    with data as a one-key object
+    (``{"response_stream_disconnected": {"http_status_code": 502}}``).
+    """
+
+    if isinstance(info, str):
+        return info, None
+    if isinstance(info, dict) and len(info) == 1:
+        name, details = next(iter(info.items()))
+        status = None
+        if isinstance(details, dict):
+            value = details.get("http_status_code", details.get("httpStatusCode"))
+            status = value if isinstance(value, int) else None
+        return str(name), status
+    return None, None
+
+
 def transient_reason(error: object) -> str | None:
     if isinstance(error, dict):
-        code = error.get("codex_error_info") or error.get("codexErrorInfo")
-        if code and str(code).casefold() in TRANSIENT_CODES:
-            return str(code)
+        code, status = error_code(error.get("codex_error_info") or error.get("codexErrorInfo"))
+        if code and re.sub(r"(?<!^)(?=[A-Z])", "_", code).casefold() in TRANSIENT_CODES:
+            # Authentication, permission and request errors fail the same way
+            # on every retry; only timeouts and rate limits are worth repeating.
+            if status is not None and 400 <= status < 500 and status not in {408, 429}:
+                return None
+            return code
         message = error.get("message", "")
         details = error.get("additional_details") or error.get("additionalDetails") or ""
         text = f"{message} {details}"
@@ -583,67 +626,233 @@ def queue_continue(codex_bin: str, thread_id: str, message: str) -> tuple[bool, 
     return completed.returncode == 0, detail
 
 
+class AppServerClient:
+    """Minimal JSON-RPC client for `codex app-server` over a child's stdio.
+
+    A plain `codex app-server` speaks newline-delimited JSON. With
+    ``websocket=True`` the child is `codex app-server proxy`, which relays raw
+    bytes to the shared daemon's control socket; that socket speaks WebSocket,
+    so messages are framed accordingly. Replies are read on a helper thread so
+    every wait honours the deadline on all platforms.
+    """
+
+    def __init__(
+        self, command: Sequence[str], timeout_ms: int, *, websocket: bool = False
+    ) -> None:
+        self.command = list(command)
+        self.websocket = websocket
+        self.deadline = time.monotonic() + timeout_ms / 1000.0
+        self.process: subprocess.Popen | None = None
+        self._messages: "queue.Queue[dict[str, object] | str]" = queue.Queue()
+        self._write_lock = threading.Lock()
+        self._handshake_done = threading.Event()
+        self._handshake_ok = False
+        self._next_id = 0
+
+    def __enter__(self) -> "AppServerClient":
+        try:
+            self.process = subprocess.Popen(
+                self.command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                creationflags=NO_WINDOW,
+            )
+        except OSError as exc:
+            raise AppServerError(str(exc)) from exc
+        try:
+            if self.websocket:
+                self._write_raw(websocket_handshake("localhost", "/"))
+            threading.Thread(target=self._pump, daemon=True).start()
+            if self.websocket:
+                # The daemon drops a frame that arrives together with the
+                # upgrade request, so wait for the 101 before talking.
+                self._handshake_done.wait(max(0.0, self.deadline - time.monotonic()))
+                if not self._handshake_ok:
+                    try:
+                        detail = self._messages.get_nowait()
+                    except queue.Empty:
+                        detail = "timed out waiting for the daemon WebSocket handshake"
+                    raise AppServerError(str(detail))
+            self.request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "codex-desktop-auto-continue",
+                        "title": "Codex Desktop Auto Continue",
+                        "version": VERSION,
+                    },
+                    "capabilities": {"experimentalApi": True},
+                },
+            )
+            self._send({"method": "initialized", "params": {}})
+        except AppServerError:
+            stop_app_server(self.process)
+            raise
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        if self.process is not None:
+            stop_app_server(self.process)
+
+    def request(self, method: str, params: dict[str, object]) -> object:
+        self._next_id += 1
+        request_id = self._next_id
+        self._send({"id": request_id, "method": method, "params": params})
+        while True:
+            message = self._next_message()
+            if message.get("id") != request_id:
+                continue  # notifications and unrelated traffic
+            error = message.get("error")
+            if error is not None:
+                detail = error.get("message") or error.get("code") if isinstance(error, dict) else error
+                raise AppServerError(f"app-server error: {detail or error}")
+            return message.get("result")
+
+    def _next_message(self) -> dict[str, object]:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise AppServerError("timed out waiting for app-server response")
+        try:
+            message = self._messages.get(timeout=remaining)
+        except queue.Empty:
+            raise AppServerError("timed out waiting for app-server response") from None
+        if isinstance(message, str):
+            self._messages.put(message)  # keep reporting the same end-of-stream
+            raise AppServerError(message)
+        return message
+
+    def _send(self, message: dict[str, object]) -> None:
+        data = json.dumps(message, ensure_ascii=False).encode("utf-8")
+        self._write_raw(websocket_frame(0x1, data) if self.websocket else data + b"\n")
+
+    def _write_raw(self, data: bytes) -> None:
+        assert self.process is not None and self.process.stdin is not None
+        try:
+            with self._write_lock:
+                self.process.stdin.write(data)
+                self.process.stdin.flush()
+        except (OSError, ValueError) as exc:
+            raise AppServerError(f"could not write to app-server: {exc}") from exc
+
+    def _pump(self) -> None:
+        assert self.process is not None and self.process.stdout is not None
+        stream = self.process.stdout
+        try:
+            if self.websocket:
+                self._pump_websocket(stream)
+            else:
+                for raw in stream:
+                    self._deliver(raw)
+            self._messages.put("app-server closed its protocol stream")
+        except (OSError, ValueError, WebSocketError, AppServerError) as exc:
+            self._messages.put(f"app-server stream failed: {exc}")
+        finally:
+            self._handshake_done.set()
+
+    def _deliver(self, raw: bytes) -> None:
+        try:
+            message = json.loads(raw.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            return
+        if isinstance(message, dict):
+            self._messages.put(message)
+
+    def _pump_websocket(self, stream: object) -> None:
+        def read_exact(size: int) -> bytes:
+            data = stream.read(size)  # type: ignore[attr-defined]
+            if len(data) != size:
+                raise WebSocketError("daemon connection closed")
+            return data
+
+        header = bytearray()
+        while not header.endswith(b"\r\n\r\n"):
+            header.extend(read_exact(1))
+        if not header.startswith(b"HTTP/1.1 101"):
+            status = header.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+            raise WebSocketError(f"daemon WebSocket handshake failed: {status}")
+        self._handshake_ok = True
+        self._handshake_done.set()
+        fragments = bytearray()
+        while True:
+            first = read_exact(2)
+            final, opcode = first[0] & 0x80, first[0] & 0x0F
+            length = first[1] & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", read_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", read_exact(8))[0]
+            mask = read_exact(4) if first[1] & 0x80 else b""
+            data = read_exact(length) if length else b""
+            if mask:
+                data = bytes(value ^ mask[index % 4] for index, value in enumerate(data))
+            if opcode == 0x8:
+                return
+            if opcode == 0x9:
+                self._write_raw(websocket_frame(0xA, data))
+                continue
+            if opcode in (0x1, 0x2, 0x0):
+                fragments.extend(data)
+                if final:
+                    self._deliver(bytes(fragments))
+                    fragments.clear()
+
+
 def thread_name(codex_bin: str, thread_id: str, timeout_ms: int) -> tuple[bool, str, str]:
     """Read the Desktop display name without creating a turn."""
 
-    command = [codex_bin, "app-server", "--listen", "stdio://"]
     try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            creationflags=NO_WINDOW,
-        )
-    except OSError as exc:
+        with AppServerClient([codex_bin, "app-server", "--listen", "stdio://"], timeout_ms) as client:
+            result = client.request(
+                "thread/read", {"threadId": thread_id, "includeTurns": False}
+            )
+    except AppServerError as exc:
         return False, "", str(exc)
+    thread = result.get("thread") if isinstance(result, dict) else None
+    name = thread.get("name") if isinstance(thread, dict) else None
+    if not isinstance(name, str) or not name.strip():
+        return False, "", "thread/read returned no Desktop thread name"
+    return True, name, ""
 
-    assert process.stdin is not None
-    assert process.stdout is not None
-    deadline = time.monotonic() + timeout_ms / 1000.0
+
+def daemon_resume(codex_bin: str, thread_id: str, *, timeout_ms: int) -> tuple[str, str]:
+    """Resume a Goal on the shared app-server daemon hosting the live thread.
+
+    Interactive `codex` sessions run their turns inside the shared local
+    app-server daemon. There, `thread/goal/set` with status ``active`` takes
+    the same path as `/goal resume`: the Goal runtime starts a continuation
+    turn as soon as the thread is idle, with no visible user message. A
+    separate stdio app-server would only persist the status without starting a
+    turn, so the request goes through `codex app-server proxy` and is sent only
+    when the daemon reports the thread as loaded.
+
+    Returns ``(outcome, detail)``; outcome is ``goal-resumed``,
+    ``goal-inactive`` (paused, usage/budget limited or complete), ``no-goal``,
+    ``not-loaded`` or ``unavailable`` (no daemon or no proxy support).
+    """
+
     try:
-        initialize = {
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "clientInfo": {
-                    "name": "codex-desktop-auto-continue",
-                    "title": "Codex Desktop Auto Continue",
-                    "version": VERSION,
-                },
-                "capabilities": {"experimentalApi": True},
-            },
-        }
-        if not _write_json_rpc(process.stdin, initialize):
-            return False, "", "could not write initialize request"
-        ok, _, detail = _read_json_rpc_response(process.stdout, 1, deadline)
-        if not ok:
-            return False, "", detail
-        if not _write_json_rpc(process.stdin, {"method": "initialized", "params": {}}):
-            return False, "", "could not write initialized notification"
-        if not _write_json_rpc(
-            process.stdin,
-            {
-                "id": 2,
-                "method": "thread/read",
-                "params": {"threadId": thread_id, "includeTurns": False},
-            },
-        ):
-            return False, "", "could not write thread/read request"
-        ok, result, detail = _read_json_rpc_response(process.stdout, 2, deadline)
-        if not ok:
-            return False, "", detail
-        thread = result.get("thread") if isinstance(result, dict) else None
-        name = thread.get("name") if isinstance(thread, dict) else None
-        if not isinstance(name, str) or not name.strip():
-            return False, "", "thread/read returned no Desktop thread name"
-        return True, name, ""
-    finally:
-        stop_app_server(process)
+        with AppServerClient(
+            [codex_bin, "app-server", "proxy"], timeout_ms, websocket=True
+        ) as client:
+            loaded = client.request("thread/loaded/list", {})
+            data = loaded.get("data") if isinstance(loaded, dict) else None
+            if not isinstance(data, list) or thread_id not in data:
+                return "not-loaded", "the session is not open on the shared app-server daemon"
+            result = client.request("thread/goal/get", {"threadId": thread_id})
+            goal = result.get("goal") if isinstance(result, dict) else None
+            status = goal.get("status") if isinstance(goal, dict) else None
+            if status is None:
+                return "no-goal", ""
+            if status not in {"active", "blocked"}:
+                return "goal-inactive", f"Goal status is {status}"
+            client.request(
+                "thread/goal/set",
+                {"threadId": thread_id, "status": "active", "origin": "automatic"},
+            )
+            return "goal-resumed", ""
+    except AppServerError as exc:
+        return "unavailable", str(exc)
 
 
 def stop_app_server(process: subprocess.Popen) -> None:
@@ -651,7 +860,6 @@ def stop_app_server(process: subprocess.Popen) -> None:
         process.stdin.close()  # type: ignore[union-attr]
     except OSError:
         pass
-    _LINE_READERS.pop(id(process.stdout), None)
     if IS_WINDOWS:
         # An npm `codex.cmd` shim puts cmd.exe and node.exe between us and the
         # app-server; terminate() would orphan them. EOF on stdin normally
@@ -873,175 +1081,6 @@ def desktop_ui_unavailable(detail: str) -> bool:
     )
 
 
-def _write_json_rpc(stream: TextIO, message: dict[str, object]) -> bool:
-    try:
-        stream.write(json.dumps(message, ensure_ascii=False) + "\n")
-        stream.flush()
-    except (BrokenPipeError, OSError):
-        return False
-    return True
-
-
-# Pipes are read on a helper thread and handed over through a queue: select()
-# only accepts sockets on Windows, and on POSIX it cannot see lines that a
-# TextIOWrapper already buffered (several JSON-RPC messages in one chunk).
-_LINE_READERS: dict[int, "queue.Queue[str]"] = {}
-
-
-def _line_queue(stream: TextIO) -> "queue.Queue[str]":
-    lines = _LINE_READERS.get(id(stream))
-    if lines is None:
-        lines = queue.Queue()
-
-        def pump() -> None:
-            try:
-                for line in iter(stream.readline, ""):
-                    lines.put(line)
-            except (OSError, ValueError):
-                pass
-            lines.put("")
-
-        threading.Thread(target=pump, daemon=True).start()
-        _LINE_READERS[id(stream)] = lines
-    return lines
-
-
-def _readline(stream: TextIO, timeout: float) -> str | None:
-    """Return the next line, "" at EOF, or None on timeout."""
-
-    try:
-        return _line_queue(stream).get(timeout=timeout)
-    except queue.Empty:
-        return None
-
-
-def _read_json_rpc_response(
-    stream: TextIO,
-    expected_id: int,
-    deadline: float,
-) -> tuple[bool, object | None, str]:
-    """Read JSON-RPC messages until the response for expected_id arrives."""
-
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False, None, "timed out waiting for app-server response"
-        try:
-            line = _readline(stream, remaining)
-        except (OSError, ValueError) as exc:
-            return False, None, str(exc)
-        if line is None:
-            return False, None, "timed out waiting for app-server response"
-        if not line:
-            return False, None, "app-server closed its protocol stream"
-        try:
-            response = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(response, dict) or response.get("id") != expected_id:
-            continue
-        error = response.get("error")
-        if error is not None:
-            if isinstance(error, dict):
-                message = error.get("message") or error.get("code") or str(error)
-            else:
-                message = str(error)
-            return False, None, f"app-server error: {message}"
-        return True, response.get("result"), ""
-
-
-def goal_continue(
-    codex_bin: str,
-    thread_id: str,
-    *,
-    goal_active: bool | None,
-    timeout_ms: int,
-) -> tuple[bool, str]:
-    """Ask app-server to continue an existing active Goal without a user message.
-
-    Setting an active or transiently blocked Goal to ``active`` invokes Codex's
-    own Goal runtime continuation path. A transient turn failure can leave a
-    Goal in ``blocked`` (shown as stalled in Desktop), and the Goal Continue
-    control reactivates that state. When the log did not contain a recent Goal
-    event, query the current status so paused, limited, and completed Goals are
-    never resumed by accident.
-    """
-
-    command = [codex_bin, "app-server", "--listen", "stdio://"]
-    try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            creationflags=NO_WINDOW,
-        )
-    except OSError as exc:
-        return False, str(exc)
-
-    assert process.stdin is not None
-    assert process.stdout is not None
-    deadline = time.monotonic() + timeout_ms / 1000.0
-    try:
-        initialize = {
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "clientInfo": {
-                    "name": "codex-desktop-auto-continue",
-                    "title": "Codex Desktop Auto Continue",
-                    "version": VERSION,
-                },
-                "capabilities": {"experimentalApi": True},
-            },
-        }
-        if not _write_json_rpc(process.stdin, initialize):
-            return False, "could not write initialize request"
-        ok, _, detail = _read_json_rpc_response(process.stdout, 1, deadline)
-        if not ok:
-            return False, detail
-        if not _write_json_rpc(process.stdin, {"method": "initialized", "params": {}}):
-            return False, "could not write initialized notification"
-
-        current_status: str | None = "active" if goal_active is True else None
-        if current_status is None:
-            if not _write_json_rpc(
-                process.stdin,
-                {
-                    "id": 2,
-                    "method": "thread/goal/get",
-                    "params": {"threadId": thread_id},
-                },
-            ):
-                return False, "could not write thread/goal/get request"
-            ok, result, detail = _read_json_rpc_response(process.stdout, 2, deadline)
-            if not ok:
-                return False, detail
-            goal = result.get("goal") if isinstance(result, dict) else None
-            current_status = goal.get("status") if isinstance(goal, dict) else None
-            if current_status not in {"active", "blocked"}:
-                return False, f"Goal status is {current_status or 'none'}"
-
-        request_id = 3 if goal_active is None else 2
-        if not _write_json_rpc(
-            process.stdin,
-            {
-                "id": request_id,
-                "method": "thread/goal/set",
-                "params": {"threadId": thread_id, "status": "active"},
-            },
-        ):
-            return False, "could not write thread/goal/set request"
-        ok, _, detail = _read_json_rpc_response(process.stdout, request_id, deadline)
-        return (True, "") if ok else (False, detail)
-    finally:
-        stop_app_server(process)
-
-
 def acquire_lock(path: Path) -> TextIO:
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a+", encoding="utf-8")
@@ -1067,6 +1106,7 @@ def event_action(
     *,
     all_clients: bool,
     path: Path,
+    include_cli: bool = True,
 ) -> PendingContinuation | None:
     if record.get("type") == "session_meta":
         payload = record.get("payload")
@@ -1099,7 +1139,15 @@ def event_action(
     reason = transient_reason(payload.get("error"))
     if reason is None or not state.thread_id:
         return None
-    if not all_clients and state.originator != "Codex Desktop":
+    if state.originator == DESKTOP_ORIGINATOR:
+        client = "desktop"
+    elif all_clients or (
+        include_cli
+        and state.originator is not None
+        and state.originator not in NON_INTERACTIVE_ORIGINATORS
+    ):
+        client = "cli"
+    else:
         return None
 
     event_key = f"{path}:{record.get('ordinal', state.offset)}"
@@ -1111,7 +1159,9 @@ def event_action(
         goal_active = None
     else:
         goal_active = state.goal_status in {"active", "blocked"}
-    return PendingContinuation(event_key, state.thread_id, reason, goal_active=goal_active)
+    return PendingContinuation(
+        event_key, state.thread_id, reason, goal_active=goal_active, client=client
+    )
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -1218,9 +1268,14 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Process historical failures at startup; use with care.",
     )
     parser.add_argument(
+        "--desktop-only",
+        action="store_true",
+        help="Ignore interactive CLI (`codex`) sessions; handle Codex Desktop only.",
+    )
+    parser.add_argument(
         "--all-clients",
         action="store_true",
-        help="Include sessions not created by Codex Desktop.",
+        help="Also include non-interactive `codex exec` sessions.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Log actions without queueing.")
     parser.add_argument("--once", action="store_true", help="Run one scan and exit.")
@@ -1301,6 +1356,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         state,
                         all_clients=args.all_clients,
                         path=path,
+                        include_cli=not args.desktop_only,
                     )
                     if action is not None:
                         pending[action.event_key] = action
@@ -1333,7 +1389,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     continue
 
                 if args.dry_run:
-                    if args.no_desktop_ui:
+                    if action.client == "cli":
+                        print(
+                            f"[codex-auto-continue] dry-run: would resume the Goal on CLI "
+                            f"session {action.thread_id} through the app-server daemon, or "
+                            f"queue {args.message!r} without a Goal",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    elif args.no_desktop_ui:
                         print(
                             f"[codex-auto-continue] dry-run: would queue "
                             f"{args.message!r} on {action.thread_id} without Desktop UI",
@@ -1358,12 +1422,81 @@ def main(argv: Sequence[str] | None = None) -> int:
                     del pending[event_key]
                     continue
 
+                if action.client == "cli":
+                    outcome, detail = daemon_resume(
+                        args.codex_bin,
+                        action.thread_id,
+                        timeout_ms=args.app_server_timeout_ms,
+                    )
+                    if outcome == "goal-resumed":
+                        continuation_counts[action.thread_id] = count + 1
+                        print(
+                            f"[codex-auto-continue] resumed CLI Goal on {action.thread_id} "
+                            f"after {action.reason} ({count + 1}/{args.max_attempts})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        del pending[event_key]
+                        continue
+                    if outcome in {"goal-inactive", "not-loaded"}:
+                        print(
+                            f"[codex-auto-continue] not continuing CLI session "
+                            f"{action.thread_id} after {action.reason}: {detail}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        del pending[event_key]
+                        continue
+                    if outcome == "unavailable":
+                        if action.attempts >= CLI_UNAVAILABLE_ATTEMPTS:
+                            print(
+                                f"[codex-auto-continue] app-server daemon stayed unavailable "
+                                f"for CLI session {action.thread_id}; giving up: {detail}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            del pending[event_key]
+                            continue
+                        action.next_attempt_at = (
+                            now + args.desktop_unavailable_retry_ms / 1000.0
+                        )
+                        if not action.desktop_unavailable_logged:
+                            print(
+                                f"[codex-auto-continue] app-server daemon is unavailable for "
+                                f"CLI session {action.thread_id}; retrying every "
+                                f"{args.desktop_unavailable_retry_ms} ms: {detail}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            action.desktop_unavailable_logged = True
+                        continue
+                    # no-goal: an ordinary turn, continued through the queue below.
+
                 use_desktop_ui = (
-                    not args.no_desktop_ui
+                    action.client == "desktop"
+                    and not args.no_desktop_ui
                     and action.goal_active is not False
                     and (not args.goal_desktop_ui or action.goal_active is True)
                 )
                 if use_desktop_ui:
+                    # A Desktop thread that the shared daemon hosts can resume its
+                    # Goal there without touching the UI at all.
+                    outcome, detail = daemon_resume(
+                        args.codex_bin,
+                        action.thread_id,
+                        timeout_ms=args.app_server_timeout_ms,
+                    )
+                    if outcome == "goal-resumed":
+                        continuation_counts[action.thread_id] = count + 1
+                        print(
+                            f"[codex-auto-continue] resumed Desktop Goal through the "
+                            f"app-server daemon on {action.thread_id} after {action.reason} "
+                            f"({count + 1}/{args.max_attempts})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        del pending[event_key]
+                        continue
                     ok, detail = desktop_resume(
                         args.codex_bin,
                         action.thread_id,
@@ -1435,11 +1568,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                         action.desktop_ui_wait_logged = True
                     continue
 
-                elif action.goal_active is True and not args.no_desktop_ui:
+                elif (
+                    action.client == "desktop"
+                    and action.goal_active is True
+                    and not args.no_desktop_ui
+                ):
                     action.next_attempt_at = now + args.queue_retry_ms / 1000.0
                     continue
 
-                if action.goal_active is True and not args.no_desktop_ui:
+                if (
+                    action.client == "desktop"
+                    and action.goal_active is True
+                    and not args.no_desktop_ui
+                ):
                     # The live Goal control is the only safe way to resume a Goal.  A
                     # queue message would be a new user turn and could lose the Goal's
                     # stateful continuation context, so keep the event pending.

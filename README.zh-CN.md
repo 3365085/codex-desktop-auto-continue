@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-这个项目在 Linux 上为官方 **Codex Desktop** 提供同线程自动继续能力。当前安装的
+这个项目在 Linux 和 Windows 上为官方 **Codex Desktop** 和交互式 **Codex CLI**（终端里的 `codex`）提供同线程自动继续能力。当前安装的
 systemd 服务采用混合模式：活动/阻塞的 `/goal` 使用 Desktop 官方“恢复目标”按钮；
 普通对话失败则向原线程发送 `continue`，不打开 UI、不切换普通对话。
 
@@ -154,11 +154,32 @@ python3 codex_desktop_auto_continue.py \
 --goal-desktop-ui           只有活动/阻塞 Goal 使用 Desktop 按钮，普通失败走 queue
 --no-desktop-ui             所有失败都使用同线程 queue continue，不操作 Desktop 界面
 --scan-existing            处理已有错误；对旧日志有误触发风险
---all-clients              同时处理非 Desktop 会话
+--desktop-only             只处理 Desktop，忽略终端 `codex` 会话
+--all-clients              连非交互的 `codex exec` 会话也处理
 --dry-run                  只检测和记录，不发送动作
 --once                     扫描一次后退出
 --version                  显示版本
 ```
+
+## 终端 `codex`（CLI）
+
+终端里的 `codex` 默认运行在共享的本地 app-server 守护进程上（Linux、Windows 均如此）。
+监视器通过 `codex app-server proxy` 连到这个守护进程：
+
+- **CLI 的 `/goal` 中断后**：Goal 会变成 `blocked`，CLI 自己不会再继续，只能手动
+  `/goal resume`。监视器会在守护进程上把它重新设为 `active`，效果等同 `/goal resume`：
+  Goal runtime 立即开始续跑，聊天中不插入任何消息，不需要切换任何界面。
+- **普通对话失败**：向原会话排队一条 `continue`（`codex queue`），守护进程会马上开始新一轮。
+- 只处理守护进程上**正在打开**的会话；已关闭的会话不会被偷偷续跑。
+- 以下情况 CLI 不走守护进程，监视器无法接管：`--no-daemon`、`-c`/`--enable` 等命令行配置
+  覆盖、`--profile`、`--oss`、Windows 管理员终端、WSL 中 CODEX_HOME 位于 Windows 挂载盘。
+- 手动暂停、额度用尽、预算用尽或已完成的 Goal 不会被恢复。
+
+如果 Desktop 的线程也恰好由这个守护进程承载，Desktop 的 Goal 同样会直接在守护进程上恢复，
+完全不碰界面；否则才退回点击“恢复目标”按钮。
+
+此外，401/403 等认证或请求错误不再被当作可重试错误，避免无意义的反复继续；
+断流类错误（`response_stream_disconnected` 等）在会话日志中以对象形式记录，现在也能识别。
 
 ## Windows
 

@@ -29,6 +29,23 @@ class ClassificationTests(unittest.TestCase):
         error = {"message": "Selected model is at capacity. Please try a different model."}
         self.assertEqual(MODULE.transient_reason(error), "selected model is at capacity")
 
+    def test_recognizes_codes_logged_as_objects(self):
+        for info, expected in (
+            ({"response_stream_disconnected": {"http_status_code": 502}}, "response_stream_disconnected"),
+            ({"http_connection_failed": {"http_status_code": None}}, "http_connection_failed"),
+            ({"responseTooManyFailedAttempts": {"httpStatusCode": 429}}, "responseTooManyFailedAttempts"),
+        ):
+            self.assertEqual(
+                MODULE.transient_reason({"message": "x", "codex_error_info": info}), expected
+            )
+
+    def test_rejects_client_errors_that_would_repeat(self):
+        error = {
+            "message": "unexpected status 401 Unauthorized",
+            "codex_error_info": {"http_connection_failed": {"http_status_code": 401}},
+        }
+        self.assertIsNone(MODULE.transient_reason(error))
+
     def test_rejects_non_transient_error(self):
         error = {"message": "Invalid request", "codex_error_info": "bad_request"}
         self.assertIsNone(MODULE.transient_reason(error))
@@ -191,8 +208,8 @@ class SessionTests(unittest.TestCase):
         self.assertIsNotNone(action)
         self.assertTrue(action.goal_active)
 
-    def test_ignores_cli_session_by_default(self):
-        state = MODULE.FileState(offset=0, thread_id=self.thread_id, originator="codex_cli")
+    def cli_failure(self, originator, **kwargs):
+        state = MODULE.FileState(offset=0, thread_id=self.thread_id, originator=originator)
         record = {
             "ordinal": 8,
             "type": "event_msg",
@@ -201,9 +218,21 @@ class SessionTests(unittest.TestCase):
                 "error": {"codex_error_info": "response_stream_disconnected"},
             },
         }
-        self.assertIsNone(
-            MODULE.event_action(record, state, all_clients=False, path=self.path)
-        )
+        return MODULE.event_action(record, state, path=self.path, **kwargs)
+
+    def test_handles_interactive_cli_session_by_default(self):
+        for originator in ("codex-tui", "codex_cli_rs"):
+            action = self.cli_failure(originator, all_clients=False)
+            self.assertIsNotNone(action)
+            self.assertEqual(action.client, "cli")
+            self.assertEqual(action.thread_id, self.thread_id)
+
+    def test_desktop_only_ignores_cli_session(self):
+        self.assertIsNone(self.cli_failure("codex-tui", all_clients=False, include_cli=False))
+
+    def test_ignores_exec_session_unless_all_clients(self):
+        self.assertIsNone(self.cli_failure("codex_exec", all_clients=False))
+        self.assertEqual(self.cli_failure("codex_exec", all_clients=True).client, "cli")
 
     def test_deduplicates_one_failure_event(self):
         state = MODULE.FileState(
@@ -280,42 +309,81 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(detail, "")
 
-    def test_goal_continue_sets_active_goal_without_queue_message(self):
-        class RecordingStream(io.StringIO):
-            def close(self):
-                self.closed_by_test = True
-
-        class FakeProcess:
-            def __init__(self):
-                self.stdin = RecordingStream()
-                self.stdout = object()
-                self.terminated = False
-
-            def terminate(self):
-                self.terminated = True
-
-            def wait(self, timeout=None):
-                return 0
-
-            def kill(self):
-                self.terminated = True
-
-        process = FakeProcess()
-        with patch.object(MODULE.subprocess, "Popen", return_value=process), patch.object(
-            MODULE,
-            "_read_json_rpc_response",
-            side_effect=[(True, {}, ""), (True, {}, "")],
-        ):
-            ok, detail = MODULE.goal_continue(
-                "/fake/codex",
-                self.thread_id,
-                goal_active=True,
-                timeout_ms=1000,
+    def run_cli_event(self, outcome, goal_status=None):
+        records = [
+            {
+                "ordinal": 0,
+                "type": "session_meta",
+                "payload": {"id": self.thread_id, "originator": "codex-tui"},
+            }
+        ]
+        if goal_status:
+            records.append(
+                {
+                    "ordinal": 1,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_goal_updated",
+                        "goal": {"threadId": self.thread_id, "status": goal_status},
+                    },
+                }
             )
-        self.assertTrue(ok)
-        self.assertEqual(detail, "")
-        self.assertIn('"method": "thread/goal/set"', process.stdin.getvalue())
-        self.assertNotIn('"method": "thread/goal/get"', process.stdin.getvalue())
+        records.append(
+            {
+                "ordinal": 2,
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "error": {"codex_error_info": "server_overloaded"},
+                },
+            }
+        )
+        self.write_records(records)
+        output = io.StringIO()
+        with redirect_stderr(output), patch.object(
+            MODULE, "daemon_resume", return_value=outcome
+        ) as daemon, patch.object(
+            MODULE, "queue_continue", return_value=(True, "")
+        ) as queue, patch.object(
+            MODULE, "desktop_resume", side_effect=AssertionError("CLI must not use Desktop UI")
+        ):
+            code = MODULE.main(
+                [
+                    "--session-root",
+                    str(self.root),
+                    "--lock-file",
+                    str(self.root / "watcher.lock"),
+                    "--scan-existing",
+                    "--goal-desktop-ui",
+                    "--once",
+                ]
+            )
+        self.assertEqual(code, 0)
+        return daemon, queue, output.getvalue()
+
+    def test_cli_goal_resumes_through_daemon_without_queue_message(self):
+        daemon, queue, output = self.run_cli_event(("goal-resumed", ""), goal_status="blocked")
+        daemon.assert_called_once()
+        queue.assert_not_called()
+        self.assertIn("resumed CLI Goal", output)
+
+    def test_cli_ordinary_failure_queues_continue(self):
+        daemon, queue, output = self.run_cli_event(("no-goal", ""))
+        daemon.assert_called_once()
+        queue.assert_called_once()
+        self.assertIn("queued 'continue'", output)
+
+    def test_cli_session_not_on_daemon_is_left_alone(self):
+        daemon, queue, output = self.run_cli_event(
+            ("not-loaded", "the session is not open on the shared app-server daemon")
+        )
+        queue.assert_not_called()
+        self.assertIn("not continuing CLI session", output)
+
+    def test_cli_waits_while_daemon_is_unavailable(self):
+        daemon, queue, output = self.run_cli_event(("unavailable", "socket missing"))
+        queue.assert_not_called()
+        self.assertIn("app-server daemon is unavailable", output)
 
     def test_desktop_renderer_targets_official_buttons(self):
         script = MODULE._desktop_renderer_script("A thread", True, 700)
@@ -405,7 +473,7 @@ class SessionTests(unittest.TestCase):
         output = io.StringIO()
         lock_file = self.root / "watcher.lock"
         with redirect_stderr(output), patch.object(
-            MODULE, "goal_continue", side_effect=AssertionError("Goal API must not run")
+            MODULE, "daemon_resume", side_effect=AssertionError("Goal API must not run")
         ) as goal_api, patch.object(
             MODULE, "queue_continue", return_value=(True, "")
         ) as queue:
@@ -635,45 +703,38 @@ class PortabilityTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def _spawn(self, code):
-        return MODULE.subprocess.Popen(
-            [sys.executable, "-c", code],
-            stdin=MODULE.subprocess.PIPE,
-            stdout=MODULE.subprocess.PIPE,
-            stderr=MODULE.subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
+    def client(self, code, timeout_ms=10_000):
+        return MODULE.AppServerClient([sys.executable, "-c", code], timeout_ms)
 
     def test_reads_json_rpc_response_from_real_pipe(self):
-        process = self._spawn(
-            "import json\n"
-            "print('not json', flush=True)\n"
-            "print(json.dumps({'id': 1, 'result': {}}), flush=True)\n"
-            "print(json.dumps({'id': 2, 'result': {'thread': {'name': '测试'}}}), flush=True)\n"
-            "input()\n"
+        # Several messages arrive in one write, as the real app-server does.
+        code = (
+            "import json, sys\n"
+            "for line in sys.stdin:\n"
+            "    m = json.loads(line)\n"
+            "    if 'id' not in m: continue\n"
+            "    r = {'thread': {'name': '测试'}} if m['method'] == 'thread/read' else {}\n"
+            "    sys.stdout.write('not json\\n' + json.dumps({'method': 'note'}) + '\\n'\n"
+            "                     + json.dumps({'id': m['id'], 'result': r}) + '\\n')\n"
+            "    sys.stdout.flush()\n"
         )
-        try:
-            ok, result, detail = MODULE._read_json_rpc_response(
-                process.stdout, 2, MODULE.time.monotonic() + 10
-            )
-        finally:
-            MODULE.stop_app_server(process)
-        self.assertTrue(ok, detail)
+        with self.client(code) as client:
+            result = client.request("thread/read", {"threadId": "x"})
         self.assertEqual(result, {"thread": {"name": "测试"}})
 
     def test_json_rpc_read_times_out_on_silent_pipe(self):
-        process = self._spawn("input()\n")
-        try:
-            started = MODULE.time.monotonic()
-            ok, _, detail = MODULE._read_json_rpc_response(process.stdout, 1, started + 0.3)
-        finally:
-            MODULE.stop_app_server(process)
-        self.assertFalse(ok)
-        self.assertIn("timed out", detail)
+        started = MODULE.time.monotonic()
+        with self.assertRaises(MODULE.AppServerError) as raised:
+            with self.client("import sys\nsys.stdin.read()\n", timeout_ms=300):
+                pass
+        self.assertIn("timed out", str(raised.exception))
         self.assertLess(MODULE.time.monotonic() - started, 5)
+
+    def test_reports_app_server_exit(self):
+        with self.assertRaises(MODULE.AppServerError) as raised:
+            with self.client("pass\n"):
+                pass
+        self.assertIn("closed", str(raised.exception))
 
     def test_second_watcher_cannot_take_lock(self):
         path = self.root / "nested" / "watcher.lock"
@@ -710,6 +771,143 @@ class PortabilityTests(unittest.TestCase):
             sys.stderr = original
         self.assertEqual(code, 0)
         self.assertIn("[codex-auto-continue] watching", log_file.read_text(encoding="utf-8"))
+
+
+FAKE_APP_SERVER = r"""
+import json, os, struct, sys
+stdin, stdout = sys.stdin.buffer, sys.stdout.buffer
+log = open(os.environ["FAKE_APP_SERVER_LOG"], "a", encoding="utf-8")
+log.write(json.dumps(sys.argv[1:]) + "\n")
+loaded = os.environ.get("FAKE_LOADED", "")
+goal = os.environ.get("FAKE_GOAL_STATUS", "")
+
+def exact(n):
+    data = stdin.read(n)
+    if len(data) != n:
+        sys.exit(0)
+    return data
+
+def frame(payload):
+    data = json.dumps(payload).encode()
+    header = bytes((0x81, len(data))) if len(data) < 126 else bytes((0x81, 126)) + struct.pack("!H", len(data))
+    return header + data
+
+header = b""
+while not header.endswith(b"\r\n\r\n"):
+    header += exact(1)
+assert header.startswith(b"GET / HTTP/1.1"), header
+if os.name != "nt":
+    import select
+    # The real daemon loses a frame sent before the 101 arrives.
+    if select.select([stdin], [], [], 0.3)[0]:
+        log.write(json.dumps({"early_frame": True}) + "\n")
+stdout.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+stdout.write(bytes((0x89, 0)))  # a ping the client must answer
+stdout.flush()
+while True:
+    first = exact(2)
+    assert first[1] & 0x80, "client frames must be masked"
+    length = first[1] & 0x7F
+    if length == 126:
+        length = struct.unpack("!H", exact(2))[0]
+    mask = exact(4)
+    data = bytes(b ^ mask[i % 4] for i, b in enumerate(exact(length)))
+    if first[0] & 0x0F == 0xA:
+        log.write(json.dumps({"pong": True}) + "\n")
+        continue
+    message = json.loads(data)
+    log.write(json.dumps(message) + "\n")
+    log.flush()
+    if "id" not in message:
+        continue
+    method = message["method"]
+    if method == "initialize":
+        result = {"userAgent": "fake"}
+    elif method == "thread/loaded/list":
+        result = {"data": [loaded] if loaded else [], "nextCursor": None}
+    elif method == "thread/goal/get":
+        result = {"goal": {"status": goal} if goal else None}
+    elif method == "thread/goal/set":
+        result = {"goal": {"status": message["params"]["status"]}}
+    else:
+        result = {}
+    # A notification ahead of the response, in the same write, like the real server.
+    stdout.write(frame({"method": "thread/status/changed", "params": {}})
+                 + frame({"id": message["id"], "result": result}))
+    stdout.flush()
+"""
+
+
+class DaemonResumeTests(unittest.TestCase):
+    thread_id = "11111111-2222-3333-4444-555555555555"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        script = self.root / "fake_app_server.py"
+        script.write_text(FAKE_APP_SERVER, encoding="utf-8")
+        if MODULE.IS_WINDOWS:
+            self.codex = self.root / "codex.cmd"
+            self.codex.write_text(
+                f'@"{sys.executable}" "{script}" %*\r\n', encoding="utf-8"
+            )
+        else:
+            self.codex = self.root / "codex"
+            self.codex.write_text(
+                f"#!/bin/sh\nexec '{sys.executable}' '{script}' \"$@\"\n", encoding="utf-8"
+            )
+            self.codex.chmod(0o755)
+        self.log = self.root / "requests.log"
+        self.env = patch.dict(MODULE.os.environ, {"FAKE_APP_SERVER_LOG": str(self.log)})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.temp.cleanup()
+
+    def resume(self, loaded, goal_status):
+        with patch.dict(
+            MODULE.os.environ,
+            {"FAKE_LOADED": loaded, "FAKE_GOAL_STATUS": goal_status},
+        ):
+            return MODULE.daemon_resume(str(self.codex), self.thread_id, timeout_ms=10_000)
+
+    def requests(self):
+        lines = self.log.read_text(encoding="utf-8").splitlines()
+        messages = [json.loads(line) for line in lines[1:]]
+        self.assertIn({"pong": True}, messages)
+        self.assertNotIn({"early_frame": True}, messages)
+        return json.loads(lines[0]), [m for m in messages if "pong" not in m]
+
+    def test_reactivates_blocked_goal_on_daemon(self):
+        self.assertEqual(self.resume(self.thread_id, "blocked"), ("goal-resumed", ""))
+        argv, requests = self.requests()
+        self.assertEqual(argv, ["app-server", "proxy"])
+        goal_set = [r for r in requests if r.get("method") == "thread/goal/set"]
+        self.assertEqual(
+            goal_set[0]["params"],
+            {"threadId": self.thread_id, "status": "active", "origin": "automatic"},
+        )
+
+    def test_does_not_touch_session_missing_from_daemon(self):
+        outcome, _ = self.resume("", "blocked")
+        self.assertEqual(outcome, "not-loaded")
+        _, requests = self.requests()
+        self.assertNotIn("thread/goal/set", [r.get("method") for r in requests])
+
+    def test_leaves_paused_goal_alone(self):
+        self.assertEqual(self.resume(self.thread_id, "paused"), ("goal-inactive", "Goal status is paused"))
+        _, requests = self.requests()
+        self.assertNotIn("thread/goal/set", [r.get("method") for r in requests])
+
+    def test_reports_ordinary_thread(self):
+        self.assertEqual(self.resume(self.thread_id, ""), ("no-goal", ""))
+
+    def test_missing_codex_is_unavailable(self):
+        outcome, _ = MODULE.daemon_resume(
+            str(self.root / "missing-codex"), self.thread_id, timeout_ms=2000
+        )
+        self.assertEqual(outcome, "unavailable")
 
 
 @unittest.skipUnless(MODULE.IS_WINDOWS and MODULE.shutil.which("node"), "Windows with Node.js only")

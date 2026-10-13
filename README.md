@@ -2,8 +2,9 @@
 
 [简体中文](README.zh-CN.md)
 
-Automatically continue transiently failed **Codex Desktop** turns on the same
-thread. The installed systemd service uses a hybrid recovery path: active Goals
+Automatically continue transiently failed **Codex Desktop** and interactive
+**Codex CLI** (`codex` in a terminal) turns on the same thread, on Linux and
+Windows. The installed systemd service uses a hybrid recovery path: active Goals
 use the Desktop Goal button, while ordinary failures send a same-thread
 `continue` message and never select another Desktop conversation.
 
@@ -167,11 +168,39 @@ See [Effect and limitations](docs/effect-and-limitations.md) and
 --goal-desktop-ui         Use Desktop UI only for active/blocked Goals; queue ordinary failures
 --no-desktop-ui           Use same-thread queue recovery without Desktop UI
 --scan-existing           Process historical errors; dangerous on old logs
---all-clients             Include sessions not created by Codex Desktop
+--desktop-only            Handle Codex Desktop only; ignore terminal `codex` sessions
+--all-clients             Also include non-interactive `codex exec` sessions
 --dry-run                 Detect and log without queueing a continuation
 --once                    Run one scan and exit
 --version                 Print the version
 ```
+
+## Terminal `codex` (CLI)
+
+Interactive `codex` sessions run on the shared local app-server daemon by
+default (Linux and Windows). The watcher talks to it through
+`codex app-server proxy`:
+
+- **Interrupted `/goal`**: the Goal turns `blocked` and the CLI does not resume
+  it on its own. The watcher sets it back to `active` on the daemon, the same
+  as `/goal resume`: the Goal runtime continues immediately, with no chat
+  message and no UI involved.
+- **Ordinary failures**: `continue` is queued on the same session
+  (`codex queue`), and the daemon starts the next turn right away.
+- Only sessions currently open on the daemon are touched; closed sessions are
+  never resumed behind your back.
+- Sessions started with `--no-daemon`, command-line config overrides (`-c`,
+  `--enable`, ...), `--profile`, `--oss`, from an elevated Windows terminal, or
+  with a WSL `CODEX_HOME` on a Windows drive run without the daemon and cannot
+  be reached.
+- Paused, usage/budget-limited and completed Goals are left alone.
+
+If a Desktop thread happens to be hosted by the daemon too, its Goal is
+resumed there without touching the UI; otherwise the Desktop button is used.
+
+Errors are now classified more carefully: 401/403 and other client errors are
+no longer retried, and stream failures logged in object form
+(`{"response_stream_disconnected": {...}}`) are recognized.
 
 ## Windows
 
